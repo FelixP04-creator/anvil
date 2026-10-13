@@ -620,10 +620,17 @@ function renderTodos(todos) {
 }
 
 function setModelPill(s) {
+  const sel = $("model")
   const m = s.model ?? ""
-  $("model").textContent = m
-  $("model").title =
-    s.thinking && s.thinking !== "off" ? `${m} · thinking: ${s.thinking}` : m
+  const known = MODEL_SUGGESTIONS[s.kind] ?? []
+  const opts = [m, ...known].filter((v, i, a) => v && a.indexOf(v) === i)
+  sel.innerHTML = ""
+  for (const o of opts) sel.appendChild(el("option", null, o))
+  sel.value = m
+  sel.title =
+    s.thinking && s.thinking !== "off"
+      ? `Model — thinking: ${s.thinking} (change applies from the next message)`
+      : "Model — change applies from the next message"
 }
 
 function applyState(s) {
@@ -783,11 +790,12 @@ async function newSession() {
   const res = await fetch("/api/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "default" }) }).catch(() => null)
   if (!res || !res.ok) {
     toast("Could not create a session", "err")
-    return
+    return null
   }
   const created = await res.json()
   refreshList()
   await openSession(created.id)
+  return created.id
 }
 
 // ---------------------------------------------------------------- SSE
@@ -912,28 +920,58 @@ function grow() {
 }
 
 async function sendNow() {
-  if (busy || !sessionId) return
+  if (busy) return
   const input = $("input")
   const text = input.value.trim()
   if (!text) return
+  if (!sessionId) {
+    // No session yet (e.g. creation failed on load) — don't fail silently.
+    if (!(await newSession())) return
+  }
   input.value = ""
   input.style.height = "auto"
   userMsg(text)
   setBusy(true)
-  try {
-    const res = await fetch(`/api/sessions/${sessionId}/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text }),
-    })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      errorLine(err.error ?? `request failed (HTTP ${res.status})`)
-      setStatus("error", "error")
+  const res = await fetch(`/api/sessions/${sessionId}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text }),
+  }).catch(() => null)
+  if (!res) {
+    errorLine("Could not reach the anvil server")
+    setStatus("error", "error")
+    setBusy(false)
+    return
+  }
+  if (!res.ok) {
+    if (res.status === 404) {
+      // The session no longer exists on the server (e.g. after a restart).
+      // Start fresh and retry the message once.
       setBusy(false)
+      if (!(await newSession())) return
+      userMsg(text)
+      setBusy(true)
+      const retry = await fetch(`/api/sessions/${sessionId}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text }),
+      }).catch(() => null)
+      if (!retry) {
+        errorLine("Could not reach the anvil server")
+        setStatus("error", "error")
+        setBusy(false)
+        return
+      }
+      if (!retry.ok) {
+        const err = await retry.json().catch(() => ({}))
+        errorLine(err.error ?? `request failed (HTTP ${retry.status})`)
+        setStatus("error", "error")
+        setBusy(false)
+      }
+      return
     }
-  } catch (err) {
-    errorLine(String(err))
+    const err = await res.json().catch(() => ({}))
+    errorLine(err.error ?? `request failed (HTTP ${res.status})`)
     setStatus("error", "error")
     setBusy(false)
   }
@@ -970,6 +1008,24 @@ function wireComposer() {
       e.target.value = "default"
       toast("Could not change the mode", "err")
     }
+  })
+  $("model").addEventListener("change", async (e) => {
+    if (!sessionId || !e.target.value) return
+    const model = e.target.value
+    const res = await fetch(`/api/sessions/${sessionId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model }),
+    }).catch(() => null)
+    if (!res || !res.ok) {
+      const err = res ? (await res.json().catch(() => ({}))) : {}
+      toast(err.error ?? "Could not switch the model", "err")
+      await refreshState() // reverts the pill
+      return
+    }
+    const s = await res.json()
+    setModelPill(s)
+    toast(`Model: ${model}`, "ok")
   })
 }
 

@@ -205,6 +205,40 @@ async function main(): Promise<void> {
   })
   check("invalid mode rejected", badMode.status === 400)
 
+  console.log("\n— model switching (PATCH session) —")
+  const patchRes = await fetch(`${base}/api/sessions/${id}`, {
+    method: "PATCH",
+    headers: jsonHdr,
+    body: JSON.stringify({ model: "custom-model", thinking: "medium" }),
+  })
+  check("model switch accepted (200)", patchRes.status === 200)
+  const patched = await patchRes.json()
+  check(
+    "patch response carries the new settings",
+    patched.model === "custom-model" && patched.thinking === "medium",
+  )
+  const statePatch = await (await fetch(`${base}/api/sessions/${id}`)).json()
+  check("state reflects the new model", statePatch.model === "custom-model")
+  check("state reflects the new thinking", statePatch.thinking === "medium")
+  const patchEmpty = await fetch(`${base}/api/sessions/${id}`, {
+    method: "PATCH",
+    headers: jsonHdr,
+    body: JSON.stringify({ model: "   " }),
+  })
+  check("blank model rejected", patchEmpty.status === 400)
+  const patchBadThinking = await fetch(`${base}/api/sessions/${id}`, {
+    method: "PATCH",
+    headers: jsonHdr,
+    body: JSON.stringify({ thinking: "maximal" }),
+  })
+  check("invalid thinking rejected", patchBadThinking.status === 400)
+  const patchNothing = await fetch(`${base}/api/sessions/${id}`, {
+    method: "PATCH",
+    headers: jsonHdr,
+    body: JSON.stringify({}),
+  })
+  check("empty patch rejected", patchNothing.status === 400)
+
   console.log("\n— transcript & pending permissions —")
   check("no pending permission after answer", state1.pendingPermission === null)
   const tr = await (await fetch(`${base}/api/sessions/${id}/transcript`)).json()

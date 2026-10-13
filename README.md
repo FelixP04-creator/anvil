@@ -21,16 +21,20 @@ done — with a permission system that keeps you in control.
   executes them, results go back to the model, until the task is done or the
   turn limit is hit. Model text is streamed token by token (CLI and web).
 - **Robust loop** — transient provider errors (rate limits, overloads, network
-  blips) are retried with exponential backoff, and a reply cut off by the
-  token limit is continued automatically instead of being handed back
-  truncated.
+  blips) are retried with exponential backoff, a reply cut off by the token
+  limit is continued automatically instead of being handed back truncated,
+  and provider calls are guarded by timeouts (connection, first token, and
+  stream idle), so a stalled model call surfaces an error instead of hanging
+  the session forever.
 - **Three providers** — Anthropic Messages API, any OpenAI-compatible
   endpoint (`OPENAI_BASE_URL`), and the HSNR gateway (`ai.ide3.de`, models
   `Qwen/Qwen3.8-27B`, `zai-org/GLM-5.3`, `ultrabrain`, `smallbrain`), selected
   by `--provider`, the settings dialog, or by which API key is set.
 - **Model & thinking settings** — choose the model and an extended-thinking
   effort (`off` / `low` / `medium` / `high`) in the web UI settings dialog,
-  via `anvil config`, a CLI flag, or environment variables. Effort maps to
+  via `anvil config`, a CLI flag, or environment variables. In the web UI the
+  model can also be switched mid-conversation from the header dropdown (the
+  new model applies from the next message). Effort maps to
   Anthropic thinking budgets and OpenAI `reasoning_effort`; thinking streams
   back as its own collapsible block in the UI and is kept in the conversation
   history as the APIs require.

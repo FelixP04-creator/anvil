@@ -5,6 +5,13 @@
 // and streamed reasoning text (reasoning_content) is surfaced.
 
 import type { Message, Provider, ProviderRequest, ProviderResponse, ToolInput, ThinkingEffort } from "../types.ts"
+import {
+  CONNECT_TIMEOUT_MS,
+  FIRST_CHUNK_TIMEOUT_MS,
+  IDLE_TIMEOUT_MS,
+  connectSignal,
+  withTimeout,
+} from "./timeouts.ts"
 
 interface ToolCallAcc {
   id: string
@@ -106,15 +113,25 @@ export class OpenAIProvider implements Provider {
     const effort = reasoningEffortFor(req.model, req.thinking ?? "off", this.forceReasoning)
     if (effort) body.reasoning_effort = effort
 
-    const res = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: "POST",
-      signal,
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify(body),
-    })
+    const conn = connectSignal(signal, CONNECT_TIMEOUT_MS)
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        signal: conn.signal,
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify(body),
+      })
+    } catch (err) {
+      if (conn.timedOut())
+        throw new Error(`OpenAI API: connection timed out after ${CONNECT_TIMEOUT_MS / 1000}s`)
+      throw err
+    } finally {
+      conn.stop()
+    }
 
     if (!res.ok || !res.body) {
       const errBody = await res.text().catch(() => "")
@@ -158,8 +175,21 @@ export class OpenAIProvider implements Provider {
       }
     }
 
+    let firstChunk = true
     while (true) {
-      const { done, value } = await reader.read()
+      let chunk
+      try {
+        chunk = await withTimeout(
+          reader.read(),
+          firstChunk ? FIRST_CHUNK_TIMEOUT_MS : IDLE_TIMEOUT_MS,
+          firstChunk ? "waiting for the model's first token timed out" : "model stream stalled",
+        )
+      } catch (err) {
+        reader.cancel().catch(() => {})
+        throw err
+      }
+      firstChunk = false
+      const { done, value } = chunk
       if (done) break
       buffer += decoder.decode(value, { stream: true })
       let sep: number

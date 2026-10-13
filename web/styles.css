@@ -348,6 +348,26 @@ li.completed .todo-txt { text-decoration: line-through; opacity: 0.65; }
 #mode:hover { border-color: var(--faint); }
 #mode:focus { outline: none; border-color: var(--accent); }
 
+#model {
+  appearance: none;
+  -webkit-appearance: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: var(--panel)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%2398a2b3'/%3E%3C/svg%3E")
+    no-repeat right 9px center;
+  border: 1px solid var(--border-2);
+  border-radius: 999px;
+  padding: 5px 26px 5px 11px;
+  cursor: pointer;
+}
+#model:hover { border-color: var(--faint); }
+#model:focus { outline: none; border-color: var(--accent); }
+
 .pill {
   font-size: 12px;
   color: var(--muted);

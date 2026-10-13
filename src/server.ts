@@ -25,7 +25,7 @@ import {
 import type { ProviderKind } from "./providers/index.ts"
 import type { Message, Provider, ThinkingEffort, ToolContext, Tool, ToolInput } from "./types.ts"
 
-export const VERSION = "0.5.1"
+export const VERSION = "0.5.2"
 export const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
 export const THINKING: ThinkingEffort[] = THINKING_LEVELS
 
@@ -119,7 +119,11 @@ export class Session {
       })
     this.engine = new PermissionEngine(mode, ask, true)
 
-    this.tools = createMainTools(this.ctx, {
+    this.tools = this.buildTools(env)
+  }
+
+  private buildTools(env: ReturnType<typeof detectEnv>): Tool[] {
+    return createMainTools(this.ctx, {
       provider: this.provider,
       model: this.model,
       subagentSystem: buildSubagentPrompt(env),
@@ -188,6 +192,19 @@ export class Session {
   setMode(mode: PermissionMode): void {
     this.engine.mode = mode
     this.broadcast({ type: "mode_changed", mode })
+  }
+
+  /**
+   * Switch the model and/or thinking level mid-conversation. Takes effect
+   * from the next turn (an in-flight turn keeps the old settings); the
+   * system prompt and subagent tools are rebuilt to match.
+   */
+  updateOverrides(model: string | undefined, thinking: ThinkingEffort | undefined): void {
+    if (model) this.model = model
+    if (thinking) this.thinking = thinking
+    const env = detectEnv(this.cwd)
+    this.system = buildSystemPrompt(env, loadMemory(this.cwd), this.thinking !== "off")
+    this.tools = this.buildTools(env)
   }
 
   state() {
@@ -537,6 +554,25 @@ export class AnvilServer {
           session.abort()
           this.sessions.delete(m[1])
           return json(res, 200, { ok: true })
+        }
+
+        if (method === "PATCH" && !sub) {
+          const body = (await readJson(req)) ?? {}
+          const model = body.model === undefined ? undefined : String(body.model).trim()
+          const thinking = body.thinking
+          if (model === undefined && thinking === undefined) {
+            return json(res, 400, { error: "provide model and/or thinking" })
+          }
+          if (model !== undefined && !model) {
+            return json(res, 400, { error: "model must be a non-empty string" })
+          }
+          if (thinking !== undefined && !THINKING_LEVELS.includes(thinking as ThinkingEffort)) {
+            return json(res, 400, { error: `thinking must be one of: ${THINKING_LEVELS.join(" | ")}` })
+          }
+          session.updateOverrides(model, thinking as ThinkingEffort | undefined)
+          const state = session.state()
+          session.broadcast({ type: "session", ...state })
+          return json(res, 200, state)
         }
 
         if (method === "POST" && sub === "abort") {

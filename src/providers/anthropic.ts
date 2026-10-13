@@ -4,6 +4,13 @@
 // signature, which the API requires on the next turn).
 
 import type { Message, Provider, ProviderRequest, ProviderResponse, ToolInput, ThinkingEffort } from "../types.ts"
+import {
+  CONNECT_TIMEOUT_MS,
+  FIRST_CHUNK_TIMEOUT_MS,
+  IDLE_TIMEOUT_MS,
+  connectSignal,
+  withTimeout,
+} from "./timeouts.ts"
 
 interface BlockAcc {
   kind: "text" | "thinking" | "tool_use"
@@ -84,16 +91,26 @@ export class AnthropicProvider implements Provider {
       body.thinking = { type: "enabled", budget_tokens: budget }
     }
 
-    const res = await fetch(`${this.baseUrl}/v1/messages`, {
-      method: "POST",
-      signal,
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": this.apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify(body),
-    })
+    const conn = connectSignal(signal, CONNECT_TIMEOUT_MS)
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}/v1/messages`, {
+        method: "POST",
+        signal: conn.signal,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": this.apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify(body),
+      })
+    } catch (err) {
+      if (conn.timedOut())
+        throw new Error(`Anthropic API: connection timed out after ${CONNECT_TIMEOUT_MS / 1000}s`)
+      throw err
+    } finally {
+      conn.stop()
+    }
 
     if (!res.ok || !res.body) {
       const errBody = await res.text().catch(() => "")
@@ -167,8 +184,21 @@ export class AnthropicProvider implements Provider {
       }
     }
 
+    let firstChunk = true
     while (true) {
-      const { done, value } = await reader.read()
+      let chunk
+      try {
+        chunk = await withTimeout(
+          reader.read(),
+          firstChunk ? FIRST_CHUNK_TIMEOUT_MS : IDLE_TIMEOUT_MS,
+          firstChunk ? "waiting for the model's first token timed out" : "model stream stalled",
+        )
+      } catch (err) {
+        reader.cancel().catch(() => {})
+        throw err
+      }
+      firstChunk = false
+      const { done, value } = chunk
       if (done) break
       buffer += decoder.decode(value, { stream: true })
       let sep: number
