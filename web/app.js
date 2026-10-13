@@ -9,6 +9,8 @@ let busy = false
 
 /** toolName -> queue of open chip elements (tool events carry no id). */
 const openTools = new Map()
+/** ids of rendered permission cards (the event may arrive twice after a reconnect). */
+const renderedPerms = new Set()
 
 function hideEmpty() {
   const el = $("empty")
@@ -33,19 +35,24 @@ function appendUser(text) {
   append(el)
 }
 
-function ensureAssistant() {
-  if (currentTextEl) return currentTextEl
+function appendAssistant(text, streaming = false) {
   const el = document.createElement("div")
   el.className = "msg assistant"
   const role = document.createElement("div")
   role.className = "msg-role"
   role.textContent = "anvil"
-  const text = document.createElement("div")
-  text.className = "msg-text streaming"
-  el.append(role, text)
+  const body = document.createElement("div")
+  body.className = streaming ? "msg-text streaming" : "msg-text"
+  body.textContent = text
+  el.append(role, body)
   append(el)
-  currentTextEl = text
-  return text
+  return body
+}
+
+function ensureAssistant() {
+  if (currentTextEl) return currentTextEl
+  currentTextEl = appendAssistant("", true)
+  return currentTextEl
 }
 
 function finishAssistant() {
@@ -62,26 +69,35 @@ function formatInput(name, input) {
   return JSON.stringify(input).slice(0, 120)
 }
 
-function onToolStart(ev) {
+function buildTool(name, argsText, status, statusCls, outputText) {
   const chip = document.createElement("div")
   chip.className = "tool"
   const head = document.createElement("div")
   head.className = "tool-head"
-  const status = document.createElement("span")
-  status.className = "tool-status"
-  status.textContent = "…"
-  const name = document.createElement("span")
-  name.className = "tool-name"
-  name.textContent = String(ev.toolName ?? "?")
-  const args = document.createElement("span")
-  args.className = "tool-args"
-  args.textContent = formatInput(ev.toolName, ev.input)
-  args.title = args.textContent
-  head.append(status, name, args)
-  const output = document.createElement("pre")
-  output.className = "tool-output"
-  output.hidden = true
-  chip.append(head, output)
+  const statusEl = document.createElement("span")
+  statusEl.className = `tool-status ${statusCls}`.trim()
+  statusEl.textContent = status
+  const nameEl = document.createElement("span")
+  nameEl.className = "tool-name"
+  nameEl.textContent = String(name ?? "?")
+  const argsEl = document.createElement("span")
+  argsEl.className = "tool-args"
+  argsEl.textContent = argsText
+  argsEl.title = argsText
+  head.append(statusEl, nameEl, argsEl)
+  chip.append(head)
+  if (outputText && outputText.trim()) {
+    const out = document.createElement("pre")
+    out.className = "tool-output"
+    out.textContent =
+      outputText.length > 8000 ? `${outputText.slice(0, 8000)}\n… [truncated]` : outputText
+    chip.append(out)
+  }
+  return chip
+}
+
+function onToolStart(ev) {
+  const chip = buildTool(ev.toolName, formatInput(ev.toolName, ev.input), "…", "")
   append(chip)
   const list = openTools.get(ev.toolName) ?? []
   list.push(chip)
@@ -95,15 +111,18 @@ function onToolEnd(ev) {
   const status = chip.querySelector(".tool-status")
   status.textContent = ev.ok ? "ok" : "error"
   status.className = `tool-status ${ev.ok ? "ok" : "err"}`
-  const output = chip.querySelector(".tool-output")
   const text = String(ev.text ?? "")
   if (text.trim()) {
-    output.textContent = text.length > 8000 ? `${text.slice(0, 8000)}\n… [truncated]` : text
-    output.hidden = false
+    const out = document.createElement("pre")
+    out.className = "tool-output"
+    out.textContent = text.length > 8000 ? `${text.slice(0, 8000)}\n… [truncated]` : text
+    chip.append(out)
   }
 }
 
 function onPermission(ev) {
+  if (renderedPerms.has(ev.id)) return
+  renderedPerms.add(ev.id)
   const card = document.createElement("div")
   card.className = "perm"
   const q = document.createElement("div")
@@ -151,6 +170,19 @@ function setBusy(b) {
   $("send").disabled = b
 }
 
+/** Replay a finished conversation (page load / deep link). */
+function renderTranscript(entries) {
+  for (const e of entries) {
+    if (e.role === "user") appendUser(e.text)
+    else if (e.role === "assistant") appendAssistant(e.text)
+    else if (e.role === "tool") {
+      append(
+        buildTool(e.name, formatInput(e.name, e.args), e.ok ? "ok" : "error", e.ok ? "ok" : "err", e.output),
+      )
+    }
+  }
+}
+
 function handle(ev) {
   switch (ev.type) {
     case "assistant_delta":
@@ -183,6 +215,8 @@ function handle(ev) {
       if (ev.model) $("model").textContent = ev.model
       if (ev.cwd) $("cwd").textContent = ev.cwd
       if (ev.mode) $("mode").value = ev.mode
+      if (ev.busy) setBusy(true)
+      if (ev.pendingPermission) onPermission(ev.pendingPermission)
       break
     case "mode_changed":
       $("mode").value = ev.mode
@@ -253,12 +287,21 @@ function wireComposer() {
 }
 
 async function init() {
-  const res = await fetch("/api/sessions", { method: "POST" })
-  if (!res.ok) {
-    appendError("could not create a session (is the anvil server running?)")
-    return
+  // Deep link: ?session=<id> reopens an existing session; otherwise create one.
+  let s = null
+  const wanted = new URLSearchParams(location.search).get("session")
+  if (wanted) {
+    const res = await fetch(`/api/sessions/${wanted}`)
+    if (res.ok) s = await res.json()
   }
-  const s = await res.json()
+  if (!s) {
+    const res = await fetch("/api/sessions", { method: "POST" })
+    if (!res.ok) {
+      appendError("could not create a session (is the anvil server running?)")
+      return
+    }
+    s = await res.json()
+  }
   sessionId = s.id
   $("model").textContent = s.model
   $("cwd").textContent = s.cwd
@@ -266,6 +309,13 @@ async function init() {
   $("mode").value = s.mode
   connect()
   wireComposer()
+  if (s.busy) setBusy(true)
+  // Replay the conversation that happened before this page load.
+  const t = await fetch(`/api/sessions/${sessionId}/transcript`)
+  if (t.ok) {
+    const data = await t.json()
+    renderTranscript(data.entries ?? [])
+  }
   $("input").focus()
 }
 

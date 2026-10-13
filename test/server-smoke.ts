@@ -73,7 +73,10 @@ async function main(): Promise<void> {
   const id = created.id
 
   const state0 = await (await fetch(`${base}/api/sessions/${id}`)).json()
-  check("initial state", state0.mode === "default" && state0.busy === false && state0.cwd === dir)
+  check(
+    "initial state",
+    state0.mode === "default" && state0.busy === false && state0.cwd === dir && state0.pendingPermission === null,
+  )
 
   const missing = await fetch(`${base}/api/sessions/nope`)
   check("unknown session → 404", missing.status === 404)
@@ -164,6 +167,24 @@ async function main(): Promise<void> {
     body: JSON.stringify({ mode: "yolo" }),
   })
   check("invalid mode rejected", badMode.status === 400)
+
+  console.log("\n— transcript & pending permissions —")
+  check("no pending permission after answer", state1.pendingPermission === null)
+  const tr = await (await fetch(`${base}/api/sessions/${id}/transcript`)).json()
+  check(
+    "transcript contains the user turn",
+    (tr.entries ?? []).some((e: any) => e.role === "user" && e.text === "create note.txt"),
+  )
+  check(
+    "transcript tool entry carries the result",
+    (tr.entries ?? []).some(
+      (e: any) => e.role === "tool" && e.name === "Write" && e.ok === true && String(e.output).includes("Wrote"),
+    ),
+  )
+  check(
+    "transcript contains the answer",
+    (tr.entries ?? []).some((e: any) => e.role === "assistant" && String(e.text).includes("Wrote note.txt")),
+  )
 
   console.log("\n— static UI —")
   const page = await fetch(`${base}/`)
