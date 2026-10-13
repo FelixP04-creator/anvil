@@ -1,11 +1,10 @@
-// Interactive terminal loop with permission prompts.
+// Interactive terminal loop: streamed output + permission prompts.
 
 import * as readline from "node:readline/promises"
 import { runAgent, type AgentEvent, type AgentOptions } from "./agent.ts"
-import { PermissionEngine, type AskFn, type PermissionMode } from "./permissions.ts"
-import type { ToolContext } from "./types.ts"
+import { PermissionEngine, type AskFn, type PermissionMode, formatCall } from "./permissions.ts"
+import type { Message, ToolContext } from "./types.ts"
 import { renderTodos } from "./tools/todo.ts"
-import { formatCall } from "./permissions.ts"
 
 export interface ReplDeps {
   makeOptions: (engine: PermissionEngine) => AgentOptions
@@ -25,6 +24,9 @@ export async function startRepl(deps: ReplDeps): Promise<void> {
     return "deny"
   }
   const engine = new PermissionEngine(deps.mode, ask, true)
+
+  // Conversation history persists across turns so the agent remembers context.
+  const history: Message[] = []
 
   console.log("anvil — interactive mode. /help for commands, Ctrl+D or /exit to quit.")
 
@@ -68,15 +70,32 @@ export async function startRepl(deps: ReplDeps): Promise<void> {
       continue
     }
 
-    const opts = deps.makeOptions(engine)
+    history.push({ role: "user", content: [{ type: "text", text: line }] })
+
+    const base = deps.makeOptions(engine)
+    let streaming = false
     const onEvent = (e: AgentEvent) => {
-      if (e.type === "assistant_text") console.log(`\nanvil> ${e.text}\n`)
-      else if (e.type === "tool_start") console.log(`  [tool] ${formatCall(e.toolName ?? "", e.input)}`)
-      else if (e.type === "denied") console.log(`  [denied] ${e.toolName}: ${e.text}`)
-      else if (e.type === "error") console.error(`  [error] ${e.text}`)
+      if (e.type === "assistant_delta") {
+        if (!streaming) {
+          process.stdout.write("\nanvil> ")
+          streaming = true
+        }
+        process.stdout.write(e.text ?? "")
+      } else if (e.type === "assistant_text") {
+        if (streaming) process.stdout.write("\n")
+        else console.log(`\nanvil> ${e.text}\n`)
+        streaming = false
+      } else if (e.type === "tool_start") {
+        console.log(`  [tool] ${formatCall(e.toolName ?? "", e.input)}`)
+      } else if (e.type === "denied") {
+        console.log(`  [denied] ${e.toolName}: ${e.text}`)
+      } else if (e.type === "error") {
+        console.error(`  [error] ${e.text}`)
+      }
     }
+
     try {
-      await runAgent(opts, line, onEvent)
+      await runAgent({ ...base, onEvent }, history)
     } catch (err) {
       console.error(`error: ${String(err)}`)
     }

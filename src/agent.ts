@@ -1,4 +1,6 @@
 // The agent loop: model -> tool calls -> tool results -> model, until done.
+// `messages` is the conversation history; the caller appends the new user
+// message before calling and keeps the array for the next turn.
 
 import type { ContentBlock, Message, Provider, Tool, ToolContext, ToolInput } from "./types.ts"
 
@@ -8,7 +10,7 @@ export interface PermissionChecker {
 }
 
 export interface AgentEvent {
-  type: "assistant_text" | "tool_start" | "tool_end" | "denied" | "error"
+  type: "assistant_delta" | "assistant_text" | "tool_start" | "tool_end" | "denied" | "error"
   text?: string
   toolName?: string
   input?: ToolInput
@@ -34,8 +36,7 @@ export interface AgentResult {
 
 const MAX_TOOL_RESULT_CHARS = 50_000
 
-export async function runAgent(opts: AgentOptions, firstText: string): Promise<AgentResult> {
-  const messages: Message[] = [{ role: "user", content: [{ type: "text", text: firstText }] }]
+export async function runAgent(opts: AgentOptions, messages: Message[]): Promise<AgentResult> {
   const maxTurns = opts.maxTurns ?? 50
   const usage = { input: 0, output: 0 }
   let lastText = ""
@@ -43,13 +44,16 @@ export async function runAgent(opts: AgentOptions, firstText: string): Promise<A
   for (let turn = 1; turn <= maxTurns; turn++) {
     let resp
     try {
-      resp = await opts.provider.complete({
-        model: opts.model,
-        system: opts.system,
-        messages,
-        tools: opts.tools,
-        maxTokens: 8000,
-      })
+      resp = await opts.provider.complete(
+        {
+          model: opts.model,
+          system: opts.system,
+          messages,
+          tools: opts.tools,
+          maxTokens: 8000,
+        },
+        (delta) => opts.onEvent?.({ type: "assistant_delta", text: delta }),
+      )
     } catch (err) {
       const message = `Model error: ${String(err)}`
       opts.onEvent?.({ type: "error", text: message })

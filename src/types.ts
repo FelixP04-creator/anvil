@@ -60,5 +60,13 @@ export interface ProviderResponse {
 
 export interface Provider {
   name: string
-  complete(req: ProviderRequest, signal?: AbortSignal): Promise<ProviderResponse>
+  /**
+   * Run one completion. Text deltas are emitted via onDelta as they arrive
+   * (streaming); the promise resolves with the full aggregated response.
+   */
+  complete(
+    req: ProviderRequest,
+    onDelta: (text: string) => void,
+    signal?: AbortSignal,
+  ): Promise<ProviderResponse>
 }

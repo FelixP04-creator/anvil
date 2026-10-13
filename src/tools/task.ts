@@ -41,7 +41,7 @@ export function createTaskTool(ctx: ToolContext, deps: SubagentDeps): Tool {
           context: ctx,
           maxTurns: deps.maxTurns,
         },
-        prompt,
+        [{ role: "user", content: [{ type: "text", text: prompt }] }],
       )
       return { ok: true, output: `Subagent finished.\n\n${result.text}` }
     },

@@ -1,111 +1,160 @@
 # anvil
 
-**An open-source coding agent that lives in your terminal.**
+**An open-source coding agent that lives in your terminal — and in your browser.**
 
 anvil is a small, readable, MIT-licensed coding agent written in plain
-TypeScript (no build step, no dependencies). Point it at a task, and it reads,
-edits, searches, and runs commands in your project until the task is done —
-with a permission system that keeps you in control.
+TypeScript (no build step, no runtime dependencies). Point it at a task and it
+reads, edits, searches, and runs commands in your project until the task is
+done — with a permission system that keeps you in control.
 
 > anvil is an independent, original implementation. It contains no code,
 > prompts, or assets from any other product, and is not affiliated with or
-> endorsed by Anthropic or any other company.
+> endorsed by Anthropic or OpenAI.
 
-## Features (v0.1)
+## Features
 
-- **Agent loop** — model proposes tool calls, anvil executes them, results go
-  back to the model, until the task is complete or the turn limit is hit.
+- **Agent loop with streaming** — the model proposes tool calls, anvil
+  executes them, results go back to the model, until the task is done or the
+  turn limit is hit. Model text is streamed token by token (CLI and web).
+- **Two providers** — Anthropic Messages API and any OpenAI-compatible
+  endpoint (`OPENAI_BASE_URL`), selected by `--provider` or by which API key
+  is set.
 - **Core tools** — `Read`, `Write`, `Edit` (exact-match replacement), `Bash`,
   `Glob`, `Grep`, `TodoWrite`, and `Task` (subagents with their own context
   window).
-- **Permission modes**
-  - `default` — read-only tools run freely; anything else asks (once / always / deny)
-  - `acceptEdits` — file edits auto-approved, shell still asks
-  - `plan` — strictly read-only; research and planning without touching anything
-  - `bypass` — no prompts (use in sandboxes only)
-- **Subagents** — the `Task` tool delegates self-contained work to a fresh
-  context, keeping the main conversation clean.
-- **Original system prompt** — environment info, working style, safety
-  guidance (prompt-injection resistance, secret hygiene), and output rules.
-- **Provider interface** — the Anthropic Messages API is implemented out of the
-  box; the `Provider` interface makes it easy to add others.
+- **Permission modes** — `default` (ask once/always/deny), `acceptEdits`
+  (auto-approve file edits), `plan` (strictly read-only), `bypass` (no
+  prompts).
+- **Memory** — project instructions from `ANVIL.md` in the working directory
+  and user instructions from `~/.anvil/ANVIL.md` are loaded into the system
+  prompt.
+- **Web UI** — `anvil server` starts a dependency-free REST + SSE server with
+  a modern dark web interface: streamed answers, live tool-call chips with
+  output, and in-browser permission prompts.
+- **Multi-turn sessions** — the CLI REPL and web sessions keep the full
+  conversation history across turns.
 
-## Quickstart
+## Quickstart (CLI)
 
-Requires **Node.js ≥ 23.6** (runs TypeScript natively — no `tsc`, no `npm install`).
+Requires **Node.js ≥ 23.6** (native TypeScript — no `tsc`, no `npm install`).
 
 ```sh
-export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_API_KEY=sk-ant-...   # or: export OPENAI_API_KEY=...
 
-# one-shot
 node src/index.ts "fix the failing test in test/auth.test.ts"
-
-# interactive session
-node src/index.ts
-
-# let it edit files without prompting (shell still asks)
+node src/index.ts                     # interactive session
 node src/index.ts --mode acceptEdits "refactor src/utils.ts"
-```
-
-Useful options:
-
-```
---model <id>        model id (default: $ANVIL_MODEL or claude-sonnet-4-5)
---mode <mode>       default | acceptEdits | plan | bypass
---max-turns <n>     agent turn limit (default 50)
--p, --print         force one-shot output
+node src/index.ts --provider openai --model gpt-4o "explain this repo"
 ```
 
 In interactive mode: `/help`, `/mode <mode>`, `/todos`, `/exit`.
 
-## Development
+## Web UI
 
 ```sh
-node test/smoke.ts   # full agent loop against a scripted mock provider (no API key needed)
+node src/index.ts server                    # http://localhost:8787
+node src/index.ts server --port 9000 --cwd /path/to/project
 ```
+
+Open the printed URL. The UI creates a session, streams the agent's answer
+token by token, shows every tool call with its output, and renders permission
+requests as cards (Allow once / Always allow / Deny). The permission mode can
+be switched live in the header.
+
+### HTTP API (used by the UI, open to anything else)
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/health` | liveness + version |
+| `POST` | `/api/sessions` | create a session (`{ "mode": "default" }`) |
+| `GET` | `/api/sessions/:id` | state: mode, busy, todos, turns |
+| `POST` | `/api/sessions/:id/messages` | `{ "text": "…" }` → starts a turn (202) |
+| `GET` | `/api/sessions/:id/events` | SSE stream of agent events |
+| `POST` | `/api/sessions/:id/permissions` | `{ "id": "perm-1", "answer": "once" }` |
+| `POST` | `/api/sessions/:id/mode` | `{ "mode": "plan" }` |
+
+SSE events: `session`, `assistant_delta`, `assistant_text`, `tool_start`,
+`tool_end`, `permission_request`, `denied`, `error`, `turn_end`,
+`mode_changed`.
+
+## Configuration
+
+| Variable / file | Purpose |
+| --- | --- |
+| `ANTHROPIC_API_KEY` | anthropic provider |
+| `OPENAI_API_KEY` | openai provider |
+| `OPENAI_BASE_URL` | OpenAI-compatible gateway (default `https://api.openai.com/v1`) |
+| `ANVIL_MODEL` / `OPENAI_MODEL` | default model per provider |
+| `ANVIL.md` (working dir) | project memory, loaded into the prompt |
+| `~/.anvil/ANVIL.md` | user memory, loaded into the prompt |
 
 ## Architecture
 
 ```
 src/
-├── index.ts            CLI entry: arg parsing, one-shot vs interactive
-├── repl.ts             interactive loop + permission prompts
-├── agent.ts            the agent loop (model ⇄ tools)
-├── permissions.ts      permission modes, ask-once/always/deny rules
+├── index.ts            CLI: arg parsing, one-shot / interactive / server
+├── repl.ts             interactive loop: streamed output, permission prompts
+├── server.ts           REST + SSE server, sessions, static web UI
+├── agent.ts            the agent loop (model ⇄ tools), event emission
+├── permissions.ts      permission modes + ask/always/deny rules
 ├── prompt.ts           original system prompts + environment detection
+├── memory.ts           ANVIL.md loading (project + user)
 ├── types.ts            shared types (Tool, Provider, messages)
 ├── providers/
-│   └── anthropic.ts    Anthropic Messages API client (fetch, no SDK)
+│   ├── index.ts        provider factory (flag or key detection)
+│   ├── anthropic.ts    Messages API, SSE streaming, no SDK
+│   └── openai.ts       chat completions, SSE streaming, tool-calls
 └── tools/
-    ├── read.ts  write.ts  edit.ts  bash.ts  glob.ts  grep.ts  todo.ts
-    ├── task.ts         subagent delegation
+    ├── read.ts  write.ts  edit.ts  bash.ts  glob.ts  grep.ts
+    ├── todo.ts         todo list (exactly one in_progress at a time)
+    ├── task.ts         subagent delegation (nested agent loop)
     └── index.ts        tool registry
+web/
+├── index.html  styles.css  app.js   dependency-free UI (vanilla JS)
 test/
-└── smoke.ts            end-to-end loop test with a mock provider
+├── smoke.ts            agent loop, tools, permissions (mock provider)
+└── server-smoke.ts     HTTP server: sessions, SSE, permission round-trip
 ```
 
-**Agent loop** (`agent.ts`): send `system + messages + tool schemas` to the
-provider. If the reply contains tool calls, check each one through the
-permission engine, execute it, and append the results as `tool_result` blocks.
-Repeat until the model replies with plain text or `maxTurns` is reached.
+**Agent loop** (`agent.ts`): the conversation history is a plain array of
+messages kept by the caller (REPL, web session, subagent). Each turn sends
+`system + messages + tool schemas` to the provider; streamed text deltas are
+forwarded as events. If the reply contains tool calls, each one goes through
+the permission engine, is executed, and the results are appended as
+`tool_result` blocks. The loop ends when the model replies with plain text or
+`maxTurns` is reached.
 
-**Permissions** (`permissions.ts`): read-only tools never ask. Non-read-only
-tools follow the mode; in `default` mode every new tool (or, for Bash, every
-new two-word command prefix) prompts the user, with `a` remembering the choice
-for the session.
+**Permissions** (`permissions.ts`): read-only tools never ask. In `default`
+mode every new tool — or, for Bash, every new two-word command prefix —
+prompts with `once / always / deny`; `always` is remembered for the session.
+One-shot (non-interactive) mode denies anything that would ask, so scripts
+are safe by default.
 
-**Subagents** (`tools/task.ts`): `Task` starts a nested `runAgent` with the
-subagent prompt and the core tools (no `Task` itself, so no recursion). The
-parent gets a concise report back.
+**Subagents** (`tools/task.ts`): `Task` runs a nested agent loop with the
+subagent prompt and the core tools (no `Task` itself, so no recursion).
+
+**Server** (`server.ts`): each session owns its conversation history, tool
+context, and permission engine. Permission prompts suspend the turn as a
+pending promise and are broadcast over SSE; the UI answers them through the
+API. The SSE subscription is registered before the response starts, so no
+event can be lost.
 
 ## Design notes
 
-- No dependencies: `node:fs`, `node:child_process`, `node:path`, global
-  `fetch`. Glob and Grep are implemented in ~100 lines of plain TypeScript.
-- Every tool call is either auto-allowed by design (read-only) or visible to
-  the user; one-shot mode is safe by default (denies anything that would ask).
-- Bash runs a fresh shell per call (no persistent state); on Windows it uses
-  `powershell -NoProfile`, elsewhere `sh -c`. Output is capped at 30 KB.
+- Zero runtime dependencies: `node:fs`, `node:child_process`, `node:http`,
+  global `fetch`. Glob and Grep are plain TypeScript; the SSE parsers for
+  both provider APIs are hand-rolled.
+- Node's native TypeScript support means the source *is* the distribution —
+  no bundler, no lockfile.
+- Every mutating action is either auto-approved by an explicit mode choice or
+  visible to the user.
+
+## Development
+
+```sh
+node test/smoke.ts         # agent loop, tools, permissions (no network)
+node test/server-smoke.ts  # HTTP server: sessions, SSE, permission flow
+```
 
 ## License
 

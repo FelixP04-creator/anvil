@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>anvil</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2' y='4' width='12' height='3' rx='1' fill='%237aa2f7'/%3E%3Crect x='5.5' y='7' width='5' height='3' fill='%237aa2f7'/%3E%3Crect x='3' y='10' width='10' height='3' rx='1.5' fill='%23b48ce8'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark"></span>anvil</div>
+    <div class="topbar-meta">
+      <span id="model" class="pill">connecting…</span>
+      <span id="cwd" class="pill mono" title="working directory">…</span>
+      <select id="mode" title="permission mode">
+        <option value="default">default</option>
+        <option value="acceptEdits">acceptEdits</option>
+        <option value="plan">plan</option>
+        <option value="bypass">bypass</option>
+      </select>
+    </div>
+  </header>
+
+  <main id="scroller">
+    <div id="messages" class="col">
+      <div id="empty" class="empty">
+        <div class="empty-title">anvil</div>
+        <div class="empty-sub">
+          Describe a task. The agent reads, edits, and runs commands in
+          <span class="mono" id="empty-cwd">the current directory</span>.
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer class="composer">
+    <div class="composer-box">
+      <textarea id="input" rows="1" placeholder="Describe a task…  (Enter to send · Shift+Enter for a new line)"></textarea>
+      <button id="send" disabled>Send</button>
+    </div>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
