@@ -42,7 +42,19 @@ done — with a permission system that keeps you in control.
 
 ## Quickstart (CLI)
 
-Requires **Node.js ≥ 23.6** (native TypeScript — no `tsc`, no `npm install`).
+Requires **Node.js ≥ 23.6** (native TypeScript — no build step, no runtime dependencies).
+
+**Via npm** (installs the `anvil` command):
+
+```sh
+npm install -g anvil-code
+
+export ANTHROPIC_API_KEY=sk-ant-...   # or: export OPENAI_API_KEY=...
+anvil "fix the failing test in test/auth.test.ts"
+anvil                                  # interactive session
+```
+
+**From a checkout** (no install needed):
 
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-...   # or: export OPENAI_API_KEY=...
