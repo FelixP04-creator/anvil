@@ -1,6 +1,6 @@
 {
   "name": "anvil-code",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "An open-source coding agent that lives in your terminal",
   "type": "module",
   "license": "MIT",
@@ -9,9 +9,8 @@
   },
   "files": [
     "bin",
-    "src",
-    "web",
-    "scripts"
+    "dist",
+    "web"
   ],
   "engines": {
     "node": ">=23.6.0"
@@ -19,6 +18,12 @@
   "scripts": {
     "start": "node src/index.ts",
     "server": "node src/index.ts server",
-    "test": "node test/smoke.ts && node test/server-smoke.ts"
+    "test": "node test/smoke.ts && node test/server-smoke.ts",
+    "build:publish": "tsc -p tsconfig.publish.json",
+    "prepack": "npm run build:publish"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
   }
 }

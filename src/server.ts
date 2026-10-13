@@ -345,7 +345,8 @@ export class AnvilServer {
       if (method === "POST" && path === "/api/sessions") {
         const body = (await readJson(req)) ?? {}
         const id = randomUUID()
-        const mode: PermissionMode = MODES.includes(body.mode) ? body.mode : "default"
+        const requested = body.mode as PermissionMode | undefined
+        const mode: PermissionMode = requested && MODES.includes(requested) ? requested : "default"
         this.sessions.set(id, new Session(id, this.config, mode))
         return json(res, 201, { id, cwd: this.config.cwd, model: this.config.model, mode })
       }
@@ -418,9 +419,9 @@ export class AnvilServer {
 
         if (method === "POST" && sub === "mode") {
           const body = await readJson(req)
-          const mode = body?.mode
-          if (!MODES.includes(mode)) return json(res, 400, { error: `mode must be one of: ${MODES.join(" | ")}` })
-          session.setMode(mode)
+          const requested = body?.mode as PermissionMode | undefined
+          if (!requested || !MODES.includes(requested)) return json(res, 400, { error: `mode must be one of: ${MODES.join(" | ")}` })
+          session.setMode(requested)
           return json(res, 200, { ok: true })
         }
       }

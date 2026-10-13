@@ -193,8 +193,10 @@ event can be lost.
 - Zero runtime dependencies: `node:fs`, `node:child_process`, `node:http`,
   global `fetch`. Glob and Grep are plain TypeScript; the SSE parsers for
   both provider APIs are hand-rolled.
-- Node's native TypeScript support means the source *is* the distribution —
-  no bundler, no lockfile.
+- Node's native TypeScript support means a checkout runs straight from source —
+  no bundler, no lockfile. The npm tarball ships compiled JavaScript in
+  `dist/` (built at publish time — see Development), because Node does not
+  type-strip files inside `node_modules`.
 - Every mutating action is either auto-approved by an explicit mode choice or
   visible to the user.
 
@@ -203,6 +205,13 @@ event can be lost.
 ```sh
 node test/smoke.ts         # agent loop, tools, permissions (no network)
 node test/server-smoke.ts  # HTTP server: sessions, SSE, permission flow
+```
+
+### Publishing
+
+```sh
+npm install          # dev-only tooling: typescript + @types/node (not shipped)
+npm publish          # `prepack` compiles src/ -> dist/ into the tarball
 ```
 
 ## License

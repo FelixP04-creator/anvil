@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Thin launcher for the `anvil` command.
-// npm refuses to package .ts files as bin entries, so this tiny ESM shim
-// delegates to the real CLI. Node >= 23.6 runs the TypeScript natively
-// (type stripping) — no build step, no runtime dependencies.
-import("../src/index.ts");
+// The published package ships compiled JavaScript in dist/ (Node refuses to
+// type-strip files inside node_modules), built at publish time via `tsc` —
+// see tsconfig.publish.json. No runtime dependencies, no build step for users.
+import("../dist/index.js");
