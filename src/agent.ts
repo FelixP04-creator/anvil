@@ -10,7 +10,14 @@ export interface PermissionChecker {
 }
 
 export interface AgentEvent {
-  type: "assistant_delta" | "assistant_text" | "tool_start" | "tool_end" | "denied" | "error"
+  type:
+    | "assistant_delta"
+    | "assistant_text"
+    | "tool_start"
+    | "tool_end"
+    | "denied"
+    | "error"
+    | "aborted"
   text?: string
   toolName?: string
   input?: ToolInput
@@ -25,6 +32,9 @@ export interface AgentOptions {
   permissions: PermissionChecker
   context: ToolContext
   maxTurns?: number
+  /** Aborting stops the turn: the in-flight model call is cancelled and a
+   *  pending permission prompt is treated as denied. */
+  signal?: AbortSignal
   onEvent?: (e: AgentEvent) => void
 }
 
@@ -40,6 +50,13 @@ export async function runAgent(opts: AgentOptions, messages: Message[]): Promise
   const maxTurns = opts.maxTurns ?? 50
   const usage = { input: 0, output: 0 }
   let lastText = ""
+  let abortEmitted = false
+  const emitAbort = () => {
+    if (!abortEmitted) {
+      abortEmitted = true
+      opts.onEvent?.({ type: "aborted" })
+    }
+  }
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     let resp
@@ -53,8 +70,13 @@ export async function runAgent(opts: AgentOptions, messages: Message[]): Promise
           maxTokens: 8000,
         },
         (delta) => opts.onEvent?.({ type: "assistant_delta", text: delta }),
+        opts.signal,
       )
     } catch (err) {
+      if (opts.signal?.aborted) {
+        emitAbort()
+        return { text: lastText || "(stopped)", turns: turn, usage }
+      }
       const message = `Model error: ${String(err)}`
       opts.onEvent?.({ type: "error", text: message })
       return { text: lastText || message, turns: turn, usage }
@@ -79,6 +101,17 @@ export async function runAgent(opts: AgentOptions, messages: Message[]): Promise
 
     const results: ContentBlock[] = []
     for (const tu of resp.toolUse) {
+      // Stopped mid-loop: give every remaining tool_use a result so the
+      // history stays valid, then exit.
+      if (opts.signal?.aborted) {
+        results.push({
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: "Stopped by the user.",
+          is_error: true,
+        })
+        continue
+      }
       opts.onEvent?.({ type: "tool_start", toolName: tu.name, input: tu.input })
       const tool = opts.tools.find((t) => t.name === tu.name)
       let result: { ok: boolean; output: string }
@@ -109,6 +142,10 @@ export async function runAgent(opts: AgentOptions, messages: Message[]): Promise
       })
     }
     messages.push({ role: "user", content: results })
+    if (opts.signal?.aborted) {
+      emitAbort()
+      return { text: lastText || "(stopped)", turns: turn, usage }
+    }
   }
 
   return { text: lastText || "(stopped: reached the turn limit)", turns: maxTurns, usage }

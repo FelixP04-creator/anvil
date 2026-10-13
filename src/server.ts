@@ -14,7 +14,7 @@ import { loadMemory } from "./memory.ts"
 import { createMainTools, createSubagentTools } from "./tools/index.ts"
 import type { Message, Provider, ToolContext, Tool, ToolInput } from "./types.ts"
 
-export const VERSION = "0.2.0"
+export const VERSION = "0.4.0"
 export const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
 
 export interface ServerConfig {
@@ -45,17 +45,24 @@ export class Session {
   history: Message[]
   engine: PermissionEngine
   busy = false
+  createdAt = Date.now()
+  usage = { input: 0, output: 0 }
 
   private listeners = new Set<(e: ServerEvent) => void>()
   private pendingPermissions = new Map<
     string,
-    { resolve: (a: AskAnswer) => void; toolName: string; detail: string }
+    { resolve: (a: AskAnswer) => void; toolName: string; detail: string; input: ToolInput }
   >()
   private permissionCounter = 0
   private tools: Tool[]
   private provider: Provider
   private system: string
   private maxTurns: number
+  private abortController: AbortController | null = null
+  private lastTodosSig = ""
+  /** Tool results of the current turn that executed but are not in the
+   *  history yet (the turn is suspended between tool calls). */
+  private completedTools: { ok: boolean; output: string }[] = []
 
   constructor(id: string, config: ServerConfig, mode: PermissionMode) {
     this.id = id
@@ -69,11 +76,11 @@ export class Session {
     const env = detectEnv(config.cwd)
     this.system = buildSystemPrompt(env, loadMemory(config.cwd))
 
-    const ask: AskFn = (toolName, _input, detail) =>
+    const ask: AskFn = (toolName, input, detail) =>
       new Promise<AskAnswer>((resolve) => {
         const permId = `perm-${++this.permissionCounter}`
-        this.pendingPermissions.set(permId, { resolve, toolName, detail })
-        this.broadcast({ type: "permission_request", id: permId, toolName, detail })
+        this.pendingPermissions.set(permId, { resolve, toolName, detail, input })
+        this.broadcast({ type: "permission_request", id: permId, toolName, detail, input })
       })
     this.engine = new PermissionEngine(mode, ask, true)
 
@@ -109,7 +116,38 @@ export class Session {
     if (!pending) return false
     this.pendingPermissions.delete(permId)
     pending.resolve(answer)
+    // Let other connected clients (second tab, phone) dismiss the card too.
+    this.broadcast({ type: "permission_resolved", id: permId, answer })
     return true
+  }
+
+  /**
+   * Stop the running turn: cancels the in-flight model call and treats any
+   * pending permission prompt as denied. No-op when nothing is running.
+   */
+  abort(): boolean {
+    if (!this.busy) return false
+    this.abortController?.abort()
+    for (const [permId, p] of this.pendingPermissions) {
+      p.resolve("deny")
+      this.broadcast({ type: "permission_resolved", id: permId, answer: "stopped" })
+    }
+    this.pendingPermissions.clear()
+    return true
+  }
+
+  /** Auto title: the first user message, trimmed to one line. */
+  get title(): string {
+    for (const m of this.history) {
+      if (m.role !== "user") continue
+      for (const b of m.content) {
+        if (b.type === "text") {
+          const t = b.text.replace(/\s+/g, " ").trim()
+          if (t) return t.length > 64 ? t.slice(0, 64).trimEnd() + "…" : t
+        }
+      }
+    }
+    return "New session"
   }
 
   setMode(mode: PermissionMode): void {
@@ -121,18 +159,26 @@ export class Session {
     const pending = [...this.pendingPermissions.entries()]
     return {
       id: this.id,
+      title: this.title,
       cwd: this.cwd,
       model: this.model,
       mode: this.engine.mode,
       busy: this.busy,
       todos: this.ctx.todos,
+      usage: this.usage,
+      createdAt: this.createdAt,
       turns: this.history.filter(
         (m) => m.role === "user" && m.content.some((b) => b.type === "text"),
       ).length,
       // Included in the SSE "session" snapshot so (re)connecting clients can
       // re-render an unanswered permission prompt.
       pendingPermission: pending.length
-        ? { id: pending[0][0], toolName: pending[0][1].toolName, detail: pending[0][1].detail }
+        ? {
+            id: pending[0][0],
+            toolName: pending[0][1].toolName,
+            detail: pending[0][1].detail,
+            input: pending[0][1].input,
+          }
         : null,
     }
   }
@@ -146,14 +192,26 @@ export class Session {
     const filled = new Set<number>()
     for (const m of this.history) {
       if (m.role === "assistant") {
-        let text = ""
+        // Preserve the order within the response: text before the tool
+        // calls it introduces, optional trailing text after them.
+        let pre = ""
+        let post = ""
+        let toolCount = 0
         for (const b of m.content) {
-          if (b.type === "text") text += b.text
-          else if (b.type === "tool_use") {
+          if (b.type === "text") {
+            if (toolCount === 0) pre += b.text
+            else post += b.text
+          } else if (b.type === "tool_use") {
+            if (pre) {
+              out.push({ role: "assistant", text: pre })
+              pre = ""
+            }
+            toolCount++
             out.push({ role: "tool", name: b.name, args: b.input ?? {}, ok: false, output: "" })
           }
         }
-        if (text) out.push({ role: "assistant", text })
+        if (pre) out.push({ role: "assistant", text: pre })
+        if (post) out.push({ role: "assistant", text: post })
       } else {
         for (const b of m.content) {
           if (b.type === "text") out.push({ role: "user", text: b.text })
@@ -171,6 +229,19 @@ export class Session {
         }
       }
     }
+    // A suspended turn has executed some tools whose results are not in
+    // the history yet — fill those in (in order) before marking the rest
+    // as pending.
+    let ci = 0
+    for (let i = 0; i < out.length; i++) {
+      const e = out[i]
+      if (e.role === "tool" && !filled.has(i) && ci < this.completedTools.length) {
+        e.ok = this.completedTools[ci].ok
+        e.output = this.completedTools[ci].output
+        filled.add(i)
+        ci++
+      }
+    }
     // Tool calls without a result yet are still running (or waiting at a
     // permission prompt).
     for (let i = 0; i < out.length; i++) {
@@ -184,8 +255,10 @@ export class Session {
     if (this.busy) throw new Error("session is busy with another turn")
     this.busy = true
     this.history.push({ role: "user", content: [{ type: "text", text }] })
+    const ac = new AbortController()
+    this.abortController = ac
     try {
-      await runAgent(
+      const result = await runAgent(
         {
           provider: this.provider,
           model: this.model,
@@ -194,12 +267,29 @@ export class Session {
           permissions: this.engine,
           context: this.ctx,
           maxTurns: this.maxTurns,
-          onEvent: (e) => this.broadcast({ ...e }),
+          signal: ac.signal,
+          onEvent: (e) => {
+            if (e.type === "tool_end") {
+              // Remember for transcript() — results only land in the
+              // history once the whole model response has been processed.
+              this.completedTools.push({ ok: !!e.ok, output: String(e.text ?? "") })
+              const sig = JSON.stringify(this.ctx.todos)
+              if (sig !== this.lastTodosSig) {
+                this.lastTodosSig = sig
+                this.broadcast({ type: "todos", todos: this.ctx.todos })
+              }
+            }
+            this.broadcast({ ...e })
+          },
         },
         this.history,
       )
+      this.usage.input += result.usage.input
+      this.usage.output += result.usage.output
     } finally {
       this.busy = false
+      this.abortController = null
+      this.completedTools = []
       this.broadcast({ type: "turn_end" })
     }
   }
@@ -260,8 +350,26 @@ export class AnvilServer {
         return json(res, 201, { id, cwd: this.config.cwd, model: this.config.model, mode })
       }
 
+      if (method === "GET" && path === "/api/sessions") {
+        const sessions = [...this.sessions.values()]
+          .sort((a, b) => b.createdAt - a.createdAt)
+          .map((s) => {
+            const st = s.state()
+            return {
+              id: s.id,
+              title: st.title,
+              mode: st.mode,
+              busy: st.busy,
+              turns: st.turns,
+              createdAt: s.createdAt,
+              needsPermission: st.pendingPermission !== null,
+            }
+          })
+        return json(res, 200, { sessions })
+      }
+
       const m = path.match(
-        /^\/api\/sessions\/([^/]+)(?:\/(messages|events|permissions|mode|transcript))?$/,
+        /^\/api\/sessions\/([^/]+)(?:\/(messages|events|permissions|mode|transcript|abort))?$/,
       )
       if (m) {
         const session = this.sessions.get(m[1])
@@ -269,6 +377,16 @@ export class AnvilServer {
         const sub = m[2]
 
         if (method === "GET" && !sub) return json(res, 200, session.state())
+
+        if (method === "DELETE" && !sub) {
+          session.abort()
+          this.sessions.delete(m[1])
+          return json(res, 200, { ok: true })
+        }
+
+        if (method === "POST" && sub === "abort") {
+          return json(res, 200, { stopped: session.abort() })
+        }
 
         if (method === "GET" && sub === "transcript") {
           return json(res, 200, { entries: session.transcript() })

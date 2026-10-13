@@ -38,12 +38,15 @@ const tu = (id: string, name: string, input: ToolInput) => ({ id, name, input })
 class MockProvider implements Provider {
   name = "mock"
   script: ProviderResponse[]
+  /** true once a completion was handed an AbortSignal (the stop wiring) */
+  sawSignal = false
 
   constructor(script: ProviderResponse[]) {
     this.script = script
   }
 
-  async complete(_req: ProviderRequest, onDelta: (t: string) => void): Promise<ProviderResponse> {
+  async complete(_req: ProviderRequest, onDelta: (t: string) => void, signal?: AbortSignal): Promise<ProviderResponse> {
+    if (signal) this.sawSignal = true
     const resp = this.script.shift() ?? { text: "DONE", toolUse: [], stop: "end_turn" }
     if (resp.text) onDelta(resp.text)
     return resp
@@ -186,8 +189,75 @@ async function main(): Promise<void> {
     (tr.entries ?? []).some((e: any) => e.role === "assistant" && String(e.text).includes("Wrote note.txt")),
   )
 
+  console.log("\n— session list —")
+  const list = await (await fetch(`${base}/api/sessions`)).json()
+  const entry = (list.sessions ?? []).find((s: any) => s.id === id)
+  check("session list contains the session", !!entry)
+  check("list entry has an auto title", entry?.title === "create note.txt")
+  check("list entry carries turn count", entry?.turns === 1)
+
+  console.log("\n— abort (stop the running turn) —")
+  // A fresh session whose turn parks at a permission prompt, then we abort it.
+  const provider2 = new MockProvider([
+    { text: "", toolUse: [tu("t3", "Write", { file_path: join(dir, "abort.txt"), content: "x" })], stop: "tool_use" },
+    { text: "Should not run.", toolUse: [], stop: "end_turn" },
+  ])
+  const server2 = new AnvilServer({ provider: provider2, model: "mock-model", cwd: dir })
+  const port2 = await server2.listen(0)
+  const base2 = `http://127.0.0.1:${port2}`
+
+  const created2 = await (
+    await fetch(`${base2}/api/sessions`, { method: "POST", headers: jsonHdr, body: JSON.stringify({ mode: "default" }) })
+  ).json()
+  const id2 = created2.id
+
+  const started2 = await fetch(`${base2}/api/sessions/${id2}/messages`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ text: "create abort.txt" }),
+  })
+  check("second message accepted (202)", started2.status === 202)
+
+  // Wait until the turn is parked at the permission prompt.
+  const parked = await (async () => {
+    for (let i = 0; i < 200; i++) {
+      const s = await (await fetch(`${base2}/api/sessions/${id2}`)).json()
+      if (s.pendingPermission) return s
+      await new Promise((r) => setTimeout(r, 25))
+    }
+    throw new Error("turn never parked at a permission prompt")
+  })()
+  check("second turn parked at a permission prompt", parked.pendingPermission?.toolName === "Write")
+
+  const abortRes = await fetch(`${base2}/api/sessions/${id2}/abort`, { method: "POST" })
+  check("abort accepted while busy", (await abortRes.json()).stopped === true)
+
+  // The turn must finish and the permission must be cleared.
+  const afterAbort = await (async () => {
+    for (let i = 0; i < 200; i++) {
+      const s = await (await fetch(`${base2}/api/sessions/${id2}`)).json()
+      if (!s.busy && !s.pendingPermission) return s
+      await new Promise((r) => setTimeout(r, 25))
+    }
+    throw new Error("turn did not end after abort")
+  })()
+  check("session not busy after abort", afterAbort.busy === false)
+  check("pending permission cleared after abort", afterAbort.pendingPermission === null)
+  check("abort wired an AbortSignal to the provider", provider2.sawSignal === true)
+
+  // Aborting an idle session is a no-op.
+  const abortIdle = await (await fetch(`${base2}/api/sessions/${id2}/abort`, { method: "POST" })).json()
+  check("abort when idle is a no-op", abortIdle.stopped === false)
+
+  // Delete the session.
+  const del = await fetch(`${base2}/api/sessions/${id2}`, { method: "DELETE" })
+  check("session deleted", del.status === 200)
+  check("deleted session → 404", (await fetch(`${base2}/api/sessions/${id2}`)).status === 404)
+
+  await server2.close()
+
   console.log("\n— static UI —")
-  const page = await fetch(`${base}/`)
+  const page = await fetch(`${base}`)
   const html = await page.text()
   check("serves index.html", page.status === 200 && html.includes("anvil"))
   check("serves styles.css", (await fetch(`${base}/styles.css`)).status === 200)

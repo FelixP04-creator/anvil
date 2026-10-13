@@ -12,7 +12,7 @@ done — with a permission system that keeps you in control.
 > endorsed by Anthropic or OpenAI.
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="anvil web UI: streamed answer, tool chips with output, and a permission prompt" width="900">
+  <img src="docs/screenshot.png" alt="anvil web UI: session sidebar with live todo panel, streamed markdown answer with syntax highlighting, compact tool chips, and a red stop button" width="900">
 </p>
 
 ## Features
@@ -33,8 +33,10 @@ done — with a permission system that keeps you in control.
   and user instructions from `~/.anvil/ANVIL.md` are loaded into the system
   prompt.
 - **Web UI** — `anvil server` starts a dependency-free REST + SSE server with
-  a modern dark web interface: streamed answers, live tool-call chips with
-  output, and in-browser permission prompts.
+  a modern web interface: streamed markdown answers with syntax-highlighted
+  code blocks, a session sidebar with auto-titles and status dots, a live
+  todo panel, collapsible tool-call chips, in-browser permission prompts,
+  light/dark themes, and a red stop button that aborts a running turn.
 - **Multi-turn sessions** — the CLI REPL and web sessions keep the full
   conversation history across turns.
 
@@ -60,12 +62,26 @@ node src/index.ts server                    # http://localhost:8787
 node src/index.ts server --port 9000 --cwd /path/to/project
 ```
 
-Open the printed URL. The UI creates a session, streams the agent's answer
-token by token, shows every tool call with its output, and renders permission
-requests as cards (Allow once / Always allow / Deny). The permission mode can
-be switched live in the header. Sessions survive page reloads: the
-`?session=<id>` deep link reopens them, and the transcript is replayed from
-the server (including a permission prompt that is still pending).
+Open the printed URL. The UI streams the agent's answer as markdown (with
+syntax-highlighted, copyable code blocks), shows every tool call as a
+collapsible chip with its output, and renders permission requests as cards
+(Allow once / Always allow / Deny — also answerable with the keys `1`/`2`/`3`).
+The permission mode can be switched live in the header.
+
+- **Sessions** — the sidebar lists every session with an auto title (first
+  message), turn count, and a status dot (pulsing while working, amber while
+  waiting for a permission). Sessions survive page reloads: the `?session=<id>`
+  deep link reopens them, and the transcript is replayed from the server,
+  including a permission prompt that is still pending.
+- **Stop** — while a turn is running the send button turns red; clicking it
+  (or pressing `Esc`) aborts the turn: the in-flight model call is cancelled
+  and a pending permission prompt is resolved as denied.
+- **Todos** — the sidebar shows the session's live todo list (as maintained by
+  the `TodoWrite` tool), with a `done/total` counter.
+- **Themes & keys** — dark (default) or light theme, remembered per browser;
+  `⌘/Ctrl+K` focuses the input, `N` starts a new session, `Esc` stops a turn.
+  Auto-scroll stays pinned while you are at the bottom and otherwise offers a
+  "latest" jump button. Token usage is shown next to the status line.
 
 Try it without any API key — a scripted mock provider with a pre-seeded
 conversation (one finished turn, one turn waiting at a permission prompt):
@@ -80,16 +96,19 @@ node scripts/demo-server.ts        # prints a ready-made session URL
 | --- | --- | --- |
 | `GET` | `/api/health` | liveness + version |
 | `POST` | `/api/sessions` | create a session (`{ "mode": "default" }`) |
-| `GET` | `/api/sessions/:id` | state: mode, busy, todos, turns, pending permission |
+| `GET` | `/api/sessions` | list sessions (auto title, mode, busy, turns, permission-pending) |
+| `GET` | `/api/sessions/:id` | state: title, mode, busy, todos, usage, turns, pending permission |
+| `DELETE` | `/api/sessions/:id` | delete a session (aborts a running turn first) |
 | `GET` | `/api/sessions/:id/transcript` | renderable replay of everything that happened |
 | `POST` | `/api/sessions/:id/messages` | `{ "text": "…" }` → starts a turn (202) |
+| `POST` | `/api/sessions/:id/abort` | stop the running turn (`{ "stopped": true }`) |
 | `GET` | `/api/sessions/:id/events` | SSE stream of agent events |
 | `POST` | `/api/sessions/:id/permissions` | `{ "id": "perm-1", "answer": "once" }` |
 | `POST` | `/api/sessions/:id/mode` | `{ "mode": "plan" }` |
 
 SSE events: `session`, `assistant_delta`, `assistant_text`, `tool_start`,
-`tool_end`, `permission_request`, `denied`, `error`, `turn_end`,
-`mode_changed`.
+`tool_end`, `permission_request`, `permission_resolved`, `denied`, `error`,
+`aborted`, `todos`, `turn_end`, `mode_changed`.
 
 ## Configuration
 
