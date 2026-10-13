@@ -44,7 +44,18 @@ import type {
   ToolResult,
 } from "./types.ts"
 
-export const VERSION = "0.6.0"
+/** Version from package.json — single source of truth (works from src/ and dist/). */
+export function version(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const raw = readFileSync(join(here, "..", "package.json"), "utf8")
+    const v = (JSON.parse(raw) as { version?: string }).version
+    if (typeof v === "string" && v) return v
+  } catch {
+    // fall through
+  }
+  return "0.0.0"
+}
 export const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
 export const THINKING: ThinkingEffort[] = THINKING_LEVELS
 
@@ -619,7 +630,7 @@ export class AnvilServer {
 
     if (path.startsWith("/api/")) {
       if (method === "GET" && path === "/api/health") {
-        return json(res, 200, { ok: true, version: VERSION })
+        return json(res, 200, { ok: true, version: version() })
       }
 
       if (method === "GET" && path === "/api/config") {
