@@ -1,13 +1,26 @@
 // Anthropic Messages API provider with SSE streaming (no SDK, just fetch).
+// Supports extended thinking: the budget is sent when the model supports it,
+// thinking blocks are streamed back and preserved in the history (with their
+// signature, which the API requires on the next turn).
 
-import type { Provider, ProviderRequest, ProviderResponse, ToolInput } from "../types.ts"
+import type { Message, Provider, ProviderRequest, ProviderResponse, ToolInput, ThinkingEffort } from "../types.ts"
 
 interface BlockAcc {
-  kind: "text" | "tool_use"
+  kind: "text" | "thinking" | "tool_use"
   text: string
   id?: string
   name?: string
   json: string
+  signature?: string
+}
+
+/** Models that accept the `thinking` parameter (Claude 3.5+, 3.7 and 4.x). */
+const THINKING_CAPABLE = /claude-(sonnet|opus|haiku)-[4-9]\b|claude-3[-.](5|7)([-.]|$)/
+
+const THINKING_BUDGETS: Record<Exclude<ThinkingEffort, "off">, number> = {
+  low: 4096,
+  medium: 16384,
+  high: 32768,
 }
 
 function safeParse(s: string): unknown {
@@ -16,6 +29,22 @@ function safeParse(s: string): unknown {
   } catch {
     return {}
   }
+}
+
+/** Map anvil's internal messages to the wire format (only thinking blocks
+ *  use a different field name). */
+function toApiMessages(messages: Message[]): unknown[] {
+  return messages.map((m) => ({
+    role: m.role,
+    content: m.content.map((b) => {
+      if (b.type === "thinking") {
+        const out: Record<string, unknown> = { type: "thinking", thinking: b.text }
+        if (b.signature) out.signature = b.signature
+        return out
+      }
+      return b
+    }),
+  }))
 }
 
 export class AnthropicProvider implements Provider {
@@ -32,7 +61,29 @@ export class AnthropicProvider implements Provider {
     req: ProviderRequest,
     onDelta: (text: string) => void,
     signal?: AbortSignal,
+    onThinking?: (text: string) => void,
   ): Promise<ProviderResponse> {
+    let maxTokens = req.maxTokens
+    const body: Record<string, unknown> = {
+      model: req.model,
+      max_tokens: maxTokens,
+      system: req.system,
+      messages: toApiMessages(req.messages),
+      tools: req.tools.map((t) => ({
+        name: t.name,
+        description: t.description,
+        input_schema: t.inputSchema,
+      })),
+      stream: true,
+    }
+    if (req.thinking && req.thinking !== "off" && THINKING_CAPABLE.test(req.model)) {
+      const budget = THINKING_BUDGETS[req.thinking]
+      // Anthropic requires max_tokens > budget_tokens.
+      maxTokens = Math.max(maxTokens, budget + 4096)
+      body.max_tokens = maxTokens
+      body.thinking = { type: "enabled", budget_tokens: budget }
+    }
+
     const res = await fetch(`${this.baseUrl}/v1/messages`, {
       method: "POST",
       signal,
@@ -41,23 +92,12 @@ export class AnthropicProvider implements Provider {
         "x-api-key": this.apiKey,
         "anthropic-version": "2023-06-01",
       },
-      body: JSON.stringify({
-        model: req.model,
-        max_tokens: req.maxTokens,
-        system: req.system,
-        messages: req.messages,
-        tools: req.tools.map((t) => ({
-          name: t.name,
-          description: t.description,
-          input_schema: t.inputSchema,
-        })),
-        stream: true,
-      }),
+      body: JSON.stringify(body),
     })
 
     if (!res.ok || !res.body) {
-      const body = await res.text().catch(() => "")
-      throw new Error(`Anthropic API error ${res.status}: ${body.slice(0, 500)}`)
+      const errBody = await res.text().catch(() => "")
+      throw new Error(`Anthropic API error ${res.status}: ${errBody.slice(0, 500)}`)
     }
 
     const reader = res.body.getReader()
@@ -66,6 +106,7 @@ export class AnthropicProvider implements Provider {
     let stop: ProviderResponse["stop"] = "end_turn"
     let inputTokens = 0
     let outputTokens = 0
+    let thinkingTokens = 0
     const blocks: BlockAcc[] = []
 
     const handleData = (data: string) => {
@@ -80,9 +121,10 @@ export class AnthropicProvider implements Provider {
         case "message_start":
           inputTokens = msg.message?.usage?.input_tokens ?? 0
           break
-        case "content_block_start":
+        case "content_block_start": {
+          const t = msg.content_block?.type
           blocks[msg.index] =
-            msg.content_block?.type === "tool_use"
+            t === "tool_use"
               ? {
                   kind: "tool_use",
                   text: "",
@@ -90,23 +132,38 @@ export class AnthropicProvider implements Provider {
                   name: msg.content_block.name,
                   json: "",
                 }
-              : { kind: "text", text: "", json: "" }
+              : t === "thinking"
+                ? { kind: "thinking", text: "", json: "" }
+                : { kind: "text", text: "", json: "" }
           break
+        }
         case "content_block_delta": {
           const b = blocks[msg.index]
           if (!b) break
           if (msg.delta?.type === "text_delta") {
             b.text += msg.delta.text ?? ""
             onDelta(msg.delta.text ?? "")
+          } else if (msg.delta?.type === "thinking_delta") {
+            b.text += msg.delta.thinking ?? ""
+            onThinking?.(msg.delta.thinking ?? "")
           } else if (msg.delta?.type === "input_json_delta") {
             b.json += msg.delta.partial_json ?? ""
           }
           break
         }
-        case "message_delta":
-          stop = msg.delta?.stop_reason === "tool_use" ? "tool_use" : "end_turn"
-          outputTokens = msg.usage?.output_tokens ?? outputTokens
+        case "content_block_stop": {
+          // The thinking signature rides on the stop event and must be
+          // returned with the block in the next request.
+          if (msg.signature && blocks[msg.index]) blocks[msg.index].signature = msg.signature
           break
+        }
+        case "message_delta": {
+          const reason = msg.delta?.stop_reason
+          stop = reason === "tool_use" ? "tool_use" : reason === "max_tokens" ? "max_tokens" : "end_turn"
+          outputTokens = msg.usage?.output_tokens ?? outputTokens
+          thinkingTokens = msg.usage?.thinking_tokens ?? 0
+          break
+        }
       }
     }
 
@@ -133,6 +190,11 @@ export class AnthropicProvider implements Provider {
       .filter((b) => b.kind === "text")
       .map((b) => b.text)
       .join("")
+    const thought = blocks
+      .filter((b) => b.kind === "thinking")
+      .map((b) => b.text)
+      .join("\n\n")
+    const firstSig = blocks.find((b) => b.kind === "thinking" && b.signature)?.signature
     const toolUse = blocks
       .filter((b) => b.kind === "tool_use")
       .map((b) => ({
@@ -143,9 +205,11 @@ export class AnthropicProvider implements Provider {
 
     return {
       text,
+      thinking: thought || undefined,
+      thinkingSignature: firstSig,
       toolUse,
       stop,
-      usage: { input: inputTokens, output: outputTokens },
+      usage: { input: inputTokens, output: outputTokens + thinkingTokens },
     }
   }
 }

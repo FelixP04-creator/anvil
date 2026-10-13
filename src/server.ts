@@ -12,16 +12,43 @@ import { PermissionEngine, type AskAnswer, type AskFn, type PermissionMode } fro
 import { buildSubagentPrompt, buildSystemPrompt, detectEnv } from "./prompt.ts"
 import { loadMemory } from "./memory.ts"
 import { createMainTools, createSubagentTools } from "./tools/index.ts"
-import type { Message, Provider, ToolContext, Tool, ToolInput } from "./types.ts"
+import {
+  THINKING_LEVELS,
+  configPath,
+  loadConfig,
+  maskKey,
+  resolveSettings,
+  saveConfig,
+  type FileConfig,
+  type ResolvedSettings,
+} from "./config.ts"
+import type { ProviderKind } from "./providers/index.ts"
+import type { Message, Provider, ThinkingEffort, ToolContext, Tool, ToolInput } from "./types.ts"
 
-export const VERSION = "0.4.2"
+export const VERSION = "0.5.0"
 export const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
+export const THINKING: ThinkingEffort[] = THINKING_LEVELS
 
 export interface ServerConfig {
   provider: Provider
+  kind: ProviderKind
   model: string
+  thinking: ThinkingEffort
   cwd: string
   maxTurns?: number
+}
+
+/** What GET /api/config returns (keys are masked, never raw). */
+interface ConfigView {
+  provider: ProviderKind
+  model: string
+  thinking: ThinkingEffort
+  hasAnthropicKey: boolean
+  hasOpenaiKey: boolean
+  anthropicKey: string | null
+  openaiKey: string | null
+  openaiBaseUrl: string | null
+  configPath: string
 }
 
 export type ServerEvent = { type: string } & Record<string, unknown>
@@ -29,6 +56,7 @@ export type ServerEvent = { type: string } & Record<string, unknown>
 export type TranscriptEntry =
   | { role: "user"; text: string }
   | { role: "assistant"; text: string }
+  | { role: "thinking"; text: string }
   | { role: "tool"; name: string; args: ToolInput; ok: boolean; output: string; pending?: boolean }
 
 /**
@@ -40,7 +68,9 @@ export type TranscriptEntry =
 export class Session {
   id: string
   cwd: string
+  kind: ProviderKind
   model: string
+  thinking: ThinkingEffort
   ctx: ToolContext
   history: Message[]
   engine: PermissionEngine
@@ -64,17 +94,19 @@ export class Session {
    *  history yet (the turn is suspended between tool calls). */
   private completedTools: { ok: boolean; output: string }[] = []
 
-  constructor(id: string, config: ServerConfig, mode: PermissionMode) {
+  constructor(id: string, config: ServerConfig, mode: PermissionMode, overrides?: { model?: string; thinking?: ThinkingEffort }) {
     this.id = id
     this.cwd = config.cwd
-    this.model = config.model
+    this.kind = config.kind
+    this.model = overrides?.model || config.model
+    this.thinking = overrides?.thinking ?? config.thinking
     this.provider = config.provider
     this.maxTurns = config.maxTurns ?? 50
     this.ctx = { cwd: config.cwd, todos: [] }
     this.history = []
 
     const env = detectEnv(config.cwd)
-    this.system = buildSystemPrompt(env, loadMemory(config.cwd))
+    this.system = buildSystemPrompt(env, loadMemory(config.cwd), this.thinking !== "off")
 
     const ask: AskFn = (toolName, input, detail) =>
       new Promise<AskAnswer>((resolve) => {
@@ -161,7 +193,9 @@ export class Session {
       id: this.id,
       title: this.title,
       cwd: this.cwd,
+      kind: this.kind,
       model: this.model,
+      thinking: this.thinking,
       mode: this.engine.mode,
       busy: this.busy,
       todos: this.ctx.todos,
@@ -192,16 +226,23 @@ export class Session {
     const filled = new Set<number>()
     for (const m of this.history) {
       if (m.role === "assistant") {
-        // Preserve the order within the response: text before the tool
-        // calls it introduces, optional trailing text after them.
+        // Preserve the order within the response: optional thinking first,
+        // then text before the tool calls it introduces, then trailing text.
         let pre = ""
         let post = ""
+        let thought = ""
         let toolCount = 0
         for (const b of m.content) {
           if (b.type === "text") {
             if (toolCount === 0) pre += b.text
             else post += b.text
+          } else if (b.type === "thinking") {
+            thought += b.text
           } else if (b.type === "tool_use") {
+            if (thought) {
+              out.push({ role: "thinking", text: thought })
+              thought = ""
+            }
             if (pre) {
               out.push({ role: "assistant", text: pre })
               pre = ""
@@ -210,6 +251,7 @@ export class Session {
             out.push({ role: "tool", name: b.name, args: b.input ?? {}, ok: false, output: "" })
           }
         }
+        if (thought) out.push({ role: "thinking", text: thought })
         if (pre) out.push({ role: "assistant", text: pre })
         if (post) out.push({ role: "assistant", text: post })
       } else {
@@ -267,6 +309,7 @@ export class Session {
           permissions: this.engine,
           context: this.ctx,
           maxTurns: this.maxTurns,
+          thinking: this.thinking,
           signal: ac.signal,
           onEvent: (e) => {
             if (e.type === "tool_end") {
@@ -300,11 +343,39 @@ export class AnvilServer {
   private server: Server | null = null
   private webRoot: string
   private config: ServerConfig
+  private settings: ResolvedSettings | null
 
-  constructor(config: ServerConfig) {
+  constructor(config: ServerConfig, settings?: ResolvedSettings) {
     this.config = config
+    try {
+      this.settings = settings ?? resolveSettings()
+    } catch {
+      // No keys resolvable (mock/demo setup) — settings still work via the
+      // config file once the user stores keys.
+      this.settings = settings ?? null
+    }
     const here = dirname(fileURLToPath(import.meta.url))
     this.webRoot = normalize(join(here, "..", "web"))
+  }
+
+  private configView(): ConfigView {
+    const file = loadConfig()
+    const anthropicKey = process.env.ANTHROPIC_API_KEY || file.anthropicKey
+    const openaiKey = process.env.OPENAI_API_KEY || file.openaiKey
+    const s = this.settings
+    return {
+      provider:
+        s?.kind ??
+        (file.provider || (anthropicKey ? "anthropic" : openaiKey ? "openai" : this.config.kind)),
+      model: s?.model ?? (file.model || this.config.model),
+      thinking: s?.thinking ?? (file.thinking ?? this.config.thinking),
+      hasAnthropicKey: Boolean(anthropicKey),
+      hasOpenaiKey: Boolean(openaiKey),
+      anthropicKey: maskKey(anthropicKey),
+      openaiKey: maskKey(openaiKey),
+      openaiBaseUrl: process.env.OPENAI_BASE_URL || file.openaiBaseUrl || null,
+      configPath: configPath(),
+    }
   }
 
   /** Start listening; returns the actual port (pass 0 for an ephemeral one). */
@@ -342,13 +413,84 @@ export class AnvilServer {
         return json(res, 200, { ok: true, version: VERSION })
       }
 
+      if (method === "GET" && path === "/api/config") {
+        return json(res, 200, this.configView())
+      }
+
+      if (method === "PUT" && path === "/api/config") {
+        const body = (await readJson(req)) ?? {}
+        const str = (k: string): string | undefined =>
+          typeof body[k] === "string" ? (body[k] as string).trim() : undefined
+        const patch: Partial<FileConfig> = {}
+        const provider = str("provider")
+        if (provider !== undefined) {
+          if (provider !== "" && provider !== "anthropic" && provider !== "openai") {
+            return json(res, 400, { error: "provider must be one of: anthropic | openai (or empty to auto-detect)" })
+          }
+          patch.provider = (provider || undefined) as ProviderKind
+        }
+        const model = str("model")
+        if (model !== undefined) patch.model = model
+        const thinking = str("thinking")
+        if (thinking !== undefined) {
+          if (!THINKING_LEVELS.includes(thinking as ThinkingEffort)) {
+            return json(res, 400, { error: `thinking must be one of: ${THINKING_LEVELS.join(" | ")}` })
+          }
+          patch.thinking = thinking as ThinkingEffort
+        }
+        const anthropicKey = str("anthropicKey")
+        if (anthropicKey !== undefined) patch.anthropicKey = anthropicKey
+        const openaiKey = str("openaiKey")
+        if (openaiKey !== undefined) patch.openaiKey = openaiKey
+        const baseUrl = str("openaiBaseUrl")
+        if (baseUrl !== undefined) patch.openaiBaseUrl = baseUrl
+
+        saveConfig(patch)
+        // Re-resolve the provider. When no API key is resolvable at all
+        // (e.g. a mock/demo server) the settings are still saved — model and
+        // thinking become active as soon as a key exists.
+        let note = "settings apply to new sessions"
+        try {
+          const s = resolveSettings()
+          this.settings = s
+          this.config = {
+            provider: s.provider,
+            kind: s.kind,
+            model: s.model,
+            thinking: s.thinking,
+            cwd: this.config.cwd,
+            maxTurns: this.config.maxTurns,
+          }
+        } catch {
+          this.settings = null
+          const file = loadConfig()
+          this.config = {
+            ...this.config,
+            model: file.model || this.config.model,
+            thinking: file.thinking ?? this.config.thinking,
+          }
+          note = "saved — no usable API key found yet, so the settings are not active"
+        }
+        return json(res, 200, { ok: true, note, config: this.configView() })
+      }
+
       if (method === "POST" && path === "/api/sessions") {
         const body = (await readJson(req)) ?? {}
         const id = randomUUID()
         const requested = body.mode as PermissionMode | undefined
         const mode: PermissionMode = requested && MODES.includes(requested) ? requested : "default"
-        this.sessions.set(id, new Session(id, this.config, mode))
-        return json(res, 201, { id, cwd: this.config.cwd, model: this.config.model, mode })
+        const thinkingReq = body.thinking as ThinkingEffort | undefined
+        const thinking = thinkingReq && THINKING_LEVELS.includes(thinkingReq) ? thinkingReq : undefined
+        const modelReq = typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined
+        const session = new Session(id, this.config, mode, { model: modelReq, thinking })
+        this.sessions.set(id, session)
+        return json(res, 201, {
+          id,
+          cwd: this.config.cwd,
+          model: session.model,
+          thinking: session.thinking,
+          mode,
+        })
       }
 
       if (method === "GET" && path === "/api/sessions") {

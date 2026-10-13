@@ -3,13 +3,22 @@
 
 import { runAgent, type AgentEvent, type AgentOptions } from "./agent.ts"
 import { PermissionEngine, type PermissionMode, formatCall } from "./permissions.ts"
-import { createProvider, defaultModelFor, type ProviderKind } from "./providers/index.ts"
+import { type ProviderKind } from "./providers/index.ts"
+import {
+  THINKING_LEVELS,
+  configPath,
+  loadConfig,
+  maskKey,
+  resolveSettings,
+  saveConfig,
+  type FileConfig,
+} from "./config.ts"
 import { buildSubagentPrompt, buildSystemPrompt, detectEnv } from "./prompt.ts"
 import { loadMemory } from "./memory.ts"
 import { createMainTools, createSubagentTools } from "./tools/index.ts"
 import { startRepl } from "./repl.ts"
 import { AnvilServer } from "./server.ts"
-import type { Message, ToolContext } from "./types.ts"
+import type { Message, ThinkingEffort, ToolContext } from "./types.ts"
 
 const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
 
@@ -20,10 +29,12 @@ usage:
   anvil [task...]                  one-shot: run the task and print the result
   anvil                            interactive session
   anvil server [options]           start the web server (REST + SSE + web UI)
+  anvil config [command]           show or change persistent settings
 
 options:
   --provider <kind>     anthropic | openai (default: whichever API key is set)
   --model <id>          model id (default: $ANVIL_MODEL / $OPENAI_MODEL or per-provider default)
+  --thinking <level>    off | low | medium | high (extended thinking, default: off)
   --mode <mode>         default | acceptEdits | plan | bypass (default: default)
   --max-turns <n>       agent turn limit (default: 50)
   -p, --print           force one-shot output even with a TTY
@@ -33,31 +44,111 @@ server options:
   --port <n>            port for "anvil server" (default: 8787)
   --cwd <dir>           working directory for "anvil server" (default: current)
 
+config commands:
+  anvil config                       show settings (keys masked)
+  anvil config set <field> <value>   set provider | model | thinking |
+                                     anthropic-key | openai-key | openai-base-url
+  anvil config unset <field>         remove a field
+
+settings are stored in ~/.anvil.json. Resolution order:
+  CLI flags > environment > config file > defaults
+
 environment:
-  ANTHROPIC_API_KEY     required for the anthropic provider
-  OPENAI_API_KEY        required for the openai provider
+  ANTHROPIC_API_KEY     API key for the anthropic provider
+  OPENAI_API_KEY        API key for the openai provider
   OPENAI_BASE_URL       OpenAI-compatible gateway base (default: https://api.openai.com/v1)
   ANVIL_MODEL           default model for the anthropic provider
-  OPENAI_MODEL          default model for the openai provider`)
+  OPENAI_MODEL          default model for the openai provider
+  ANVIL_CONFIG          config file location (default: ~/.anvil.json)`)
+}
+
+const CONFIG_FIELDS = ["provider", "model", "thinking", "anthropic-key", "openai-key", "openai-base-url"] as const
+type ConfigField = (typeof CONFIG_FIELDS)[number]
+
+function fieldToKey(field: ConfigField): keyof FileConfig {
+  if (field === "anthropic-key") return "anthropicKey"
+  if (field === "openai-key") return "openaiKey"
+  if (field === "openai-base-url") return "openaiBaseUrl"
+  return field
+}
+
+function runConfigCommand(args: string[]): void {
+  const [cmd, field, ...rest] = args
+  if (!cmd || cmd === "show") {
+    const file = loadConfig()
+    const line = (label: string, value: string | undefined, masked: boolean) => {
+      console.log(`  ${label.padEnd(16)} ${value ? (masked ? maskKey(value) : value) : "—"}`)
+    }
+    console.log(`config file: ${configPath()}`)
+    console.log("")
+    line("provider", file.provider, false)
+    line("model", file.model, false)
+    line("thinking", file.thinking, false)
+    line("anthropic-key", file.anthropicKey, true)
+    line("openai-key", file.openaiKey, true)
+    line("openai-base-url", file.openaiBaseUrl, false)
+    console.log("")
+    try {
+      const s = resolveSettings()
+      console.log(`resolved:     ${s.kind} / ${s.model} / thinking: ${s.thinking}`)
+    } catch (err) {
+      console.log(`resolved:     ${String(err)}`)
+    }
+    return
+  }
+  if (cmd === "set" || cmd === "unset") {
+    if (!field || !CONFIG_FIELDS.includes(field as ConfigField)) {
+      console.error(`usage: anvil config ${cmd} <${CONFIG_FIELDS.join(" | ")}> [value]`)
+      process.exit(1)
+    }
+    const key = fieldToKey(field as ConfigField)
+    if (cmd === "unset") {
+      saveConfig({ [key]: undefined })
+      console.log(`cleared: ${field}`)
+      return
+    }
+    const value = rest.join(" ")
+    if (!value) {
+      console.error(`usage: anvil config set ${field} <value>`)
+      process.exit(1)
+    }
+    if (field === "provider" && value !== "anthropic" && value !== "openai") {
+      console.error(`provider must be one of: anthropic | openai`)
+      process.exit(1)
+    }
+    if (field === "thinking" && !THINKING_LEVELS.includes(value as ThinkingEffort)) {
+      console.error(`thinking must be one of: ${THINKING_LEVELS.join(" | ")}`)
+      process.exit(1)
+    }
+    saveConfig({ [key]: value })
+    console.log(`saved: ${field} → ${field.includes("key") ? maskKey(value) : value}`)
+    return
+  }
+  console.error(`unknown config command: ${cmd} (try: anvil config, set, unset)`)
+  process.exit(1)
 }
 
 interface Args {
-  command: "run" | "server"
+  command: "run" | "server" | "config"
   task: string
   provider: ProviderKind | undefined
   model: string
+  thinking: ThinkingEffort | undefined
   mode: PermissionMode
   maxTurns: number
   print: boolean
   port: number
   cwd: string
+  configArgs: string[]
 }
 
 function parseArgs(argv: string[]): Args {
   const parts: string[] = []
+  const configArgs: string[] = []
   let command: Args["command"] = "run"
   let provider: ProviderKind | undefined
   let model = ""
+  let thinking: ThinkingEffort | undefined
   let mode: PermissionMode = "default"
   let maxTurns = 50
   let print = false
@@ -67,8 +158,13 @@ function parseArgs(argv: string[]): Args {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === "server") command = "server"
-    else if (a === "--provider") provider = (argv[++i] as ProviderKind) ?? provider
+    else if (a === "config") {
+      command = "config"
+      configArgs.push(...argv.slice(i + 1))
+      i = argv.length
+    } else if (a === "--provider") provider = (argv[++i] as ProviderKind) ?? provider
     else if (a === "--model") model = argv[++i] ?? model
+    else if (a === "--thinking") thinking = (argv[++i] as ThinkingEffort) ?? thinking
     else if (a === "--mode") mode = (argv[++i] as PermissionMode) ?? mode
     else if (a === "--max-turns") maxTurns = parseInt(argv[++i] ?? "50", 10) || 50
     else if (a === "--port") port = parseInt(argv[++i] ?? "8787", 10) || 8787
@@ -79,7 +175,7 @@ function parseArgs(argv: string[]): Args {
       process.exit(0)
     } else parts.push(a)
   }
-  return { command, task: parts.join(" "), provider, model, mode, maxTurns, print, port, cwd }
+  return { command, task: parts.join(" "), provider, model, thinking, mode, maxTurns, print, port, cwd, configArgs }
 }
 
 async function main(): Promise<void> {
@@ -88,23 +184,36 @@ async function main(): Promise<void> {
     console.error(`error: unknown mode "${args.mode}" (use: ${MODES.join(", ")})`)
     process.exit(1)
   }
+  if (args.thinking && !THINKING_LEVELS.includes(args.thinking)) {
+    console.error(`error: unknown thinking level "${args.thinking}" (use: ${THINKING_LEVELS.join(", ")})`)
+    process.exit(1)
+  }
 
-  const { provider, kind } = createProvider(args.provider)
-  const model = args.model || defaultModelFor(kind)
+  if (args.command === "config") {
+    runConfigCommand(args.configArgs)
+    return
+  }
+
+  const settings = resolveSettings({ provider: args.provider, model: args.model || undefined, thinking: args.thinking })
+  const { provider, kind, model, thinking } = settings
 
   if (args.command === "server") {
-    const server = new AnvilServer({ provider, model, cwd: args.cwd })
+    const server = new AnvilServer(
+      { provider, kind, model, thinking, cwd: args.cwd },
+      settings,
+    )
     const port = await server.listen(args.port)
     console.log(`anvil server listening on http://localhost:${port}`)
     console.log(`  web UI:  http://localhost:${port}`)
-    console.log(`  model:   ${model} (${kind})`)
+    console.log(`  model:   ${model} (${kind}, thinking: ${thinking})`)
     console.log(`  cwd:     ${args.cwd}`)
+    console.log(`  keys:    config file ${configPath()} or environment variables`)
     return
   }
 
   const workCwd = process.cwd()
   const env = detectEnv(workCwd)
-  const system = buildSystemPrompt(env, loadMemory(workCwd))
+  const system = buildSystemPrompt(env, loadMemory(workCwd), thinking !== "off")
   const ctx: ToolContext = { cwd: workCwd, todos: [] }
   const subagentTools = createSubagentTools()
 
@@ -123,6 +232,7 @@ async function main(): Promise<void> {
     permissions: engine,
     context: ctx,
     maxTurns: args.maxTurns,
+    thinking,
   })
 
   const interactive = !args.task && !args.print && process.stdin.isTTY
@@ -142,14 +252,26 @@ async function main(): Promise<void> {
   const history: Message[] = [{ role: "user", content: [{ type: "text", text: args.task }] }]
 
   let streamed = false
+  let thought = false
   const onEvent = (e: AgentEvent) => {
-    if (e.type === "assistant_delta") {
+    if (e.type === "thinking_delta") {
+      if (!thought) {
+        thought = true
+        process.stderr.write("\nthinking…\n")
+      }
+    } else if (e.type === "assistant_delta") {
+      if (thought) {
+        process.stderr.write("\n")
+        thought = false
+      }
       streamed = true
       process.stdout.write(e.text ?? "")
     } else if (e.type === "tool_start") {
       console.error(`[tool] ${formatCall(e.toolName ?? "", e.input)}`)
     } else if (e.type === "denied") {
       console.error(`[denied] ${e.toolName}: ${e.text}`)
+    } else if (e.type === "retry") {
+      console.error(`[retry] ${e.text}`)
     } else if (e.type === "error") {
       console.error(`[error] ${e.text}`)
     }

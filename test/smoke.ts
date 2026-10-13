@@ -9,7 +9,7 @@ import { PermissionEngine } from "../src/permissions.ts"
 import { buildSystemPrompt, detectEnv } from "../src/prompt.ts"
 import { loadMemory } from "../src/memory.ts"
 import { createMainTools, createSubagentTools } from "../src/tools/index.ts"
-import type { Provider, ProviderRequest, ProviderResponse, Tool, ToolContext, ToolInput } from "../src/types.ts"
+import type { Message, Provider, ProviderRequest, ProviderResponse, Tool, ToolContext, ToolInput } from "../src/types.ts"
 
 let failures = 0
 function check(name: string, cond: boolean, extra?: string): void {
@@ -30,15 +30,47 @@ class MockProvider implements Provider {
     this.script = script
   }
 
-  async complete(req: ProviderRequest, onDelta: (t: string) => void): Promise<ProviderResponse> {
+  async complete(
+    req: ProviderRequest,
+    onDelta: (t: string) => void,
+    _signal?: AbortSignal,
+    onThinking?: (t: string) => void,
+  ): Promise<ProviderResponse> {
     this.calls++
     this.lastReq = req
     const resp = this.script.shift() ?? { text: "DONE", toolUse: [], stop: "end_turn" }
-    // Simulate streaming: emit the text in small chunks.
+    // Simulate streaming: emit thinking and text in small chunks.
+    if (resp.thinking) {
+      for (let i = 0; i < resp.thinking.length; i += 16) onThinking?.(resp.thinking.slice(i, i + 16))
+    }
     if (resp.text) {
       for (let i = 0; i < resp.text.length; i += 12) onDelta(resp.text.slice(i, i + 12))
     }
     return resp
+  }
+}
+
+/** Fails with a transient error `failsLeft` times, then succeeds. */
+class FlakyProvider implements Provider {
+  name = "flaky"
+  calls = 0
+  failsLeft: number
+
+  constructor(failsLeft = 2) {
+    this.failsLeft = failsLeft
+  }
+
+  async complete(
+    _req: ProviderRequest,
+    onDelta: (t: string) => void,
+  ): Promise<ProviderResponse> {
+    this.calls++
+    if (this.failsLeft > 0) {
+      this.failsLeft--
+      throw new Error("API error 429: overloaded")
+    }
+    onDelta("recovered")
+    return { text: "recovered", toolUse: [], stop: "end_turn" }
   }
 }
 
@@ -113,6 +145,71 @@ async function main(): Promise<void> {
   const result2 = await runAgent({ ...opts, onEvent: () => {} }, history)
   check("second turn works", result2.text.includes("Still here"))
   check("provider saw prior turns", (provider.lastReq?.messages.length ?? 0) >= 12, `msgs=${provider.lastReq?.messages.length}`)
+
+  console.log("\n— thinking —")
+  const thinkProvider = new MockProvider([
+    {
+      thinking: "Let me check the layout first, then answer.",
+      thinkingSignature: "sig-123",
+      text: "",
+      toolUse: [tu("t1", "Glob", { pattern: "**/*" })],
+      stop: "tool_use",
+    },
+    { text: "Done thinking, done globbing.", toolUse: [], stop: "end_turn" },
+  ])
+  const tEvents: AgentEvent[] = []
+  const tHistory: Message[] = [{ role: "user", content: [{ type: "text", text: "what files are here?" }] }]
+  const tResult = await runAgent(
+    { ...opts, provider: thinkProvider, thinking: "medium", onEvent: (e) => tEvents.push(e) },
+    tHistory,
+  )
+  check("thinking deltas emitted", tEvents.filter((e) => e.type === "thinking_delta").length > 0)
+  const thoughtBlock = tHistory
+    .filter((m) => m.role === "assistant")
+    .flatMap((m) => m.content)
+    .find((b) => b.type === "thinking")
+  check(
+    "thinking block stored in history",
+    Boolean(thoughtBlock && thoughtBlock.type === "thinking" && thoughtBlock.text.includes("layout")),
+  )
+  check(
+    "thinking signature preserved",
+    thoughtBlock?.type === "thinking" && thoughtBlock.signature === "sig-123",
+  )
+  check("thinking effort passed to provider", thinkProvider.lastReq?.thinking === "medium")
+  check("answer returned after thinking", tResult.text.includes("Done thinking"))
+
+  console.log("\n— max-tokens continuation —")
+  const contProvider = new MockProvider([
+    { text: "The answer starts here and is", toolUse: [], stop: "max_tokens" },
+    { text: " cut off, so I continue.", toolUse: [], stop: "end_turn" },
+  ])
+  const contHistory: Message[] = [{ role: "user", content: [{ type: "text", text: "tell me something long" }] }]
+  const cResult = await runAgent({ ...opts, provider: contProvider, onEvent: () => {} }, contHistory)
+  check("continuation triggered (2 completions)", contProvider.calls === 2, `calls=${contProvider.calls}`)
+  check(
+    "final text includes both parts",
+    cResult.text.includes("starts here") && cResult.text.includes("I continue"),
+    cResult.text,
+  )
+  check(
+    "continuation nudge appended to history",
+    contHistory.some(
+      (m) => m.role === "user" && m.content.some((b) => b.type === "text" && b.text.includes("Continue exactly where")),
+    ),
+  )
+
+  console.log("\n— retry with backoff —")
+  const flaky = new FlakyProvider(2)
+  const rEvents: AgentEvent[] = []
+  const rHistory: Message[] = [{ role: "user", content: [{ type: "text", text: "hi" }] }]
+  const rResult = await runAgent(
+    { ...opts, provider: flaky, retryBaseDelayMs: 10, onEvent: (e) => rEvents.push(e) },
+    rHistory,
+  )
+  check("recovered after transient failures", rResult.text.includes("recovered"))
+  check("provider attempted 3 times", flaky.calls === 3, `calls=${flaky.calls}`)
+  check("retry events emitted", rEvents.filter((e) => e.type === "retry").length === 2)
 
   console.log("\n— permission modes —")
   const writeTool = tools.find((t) => t.name === "Write")!

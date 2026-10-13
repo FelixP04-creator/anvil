@@ -74,21 +74,34 @@ export async function startRepl(deps: ReplDeps): Promise<void> {
 
     const base = deps.makeOptions(engine)
     let streaming = false
+    let thinking = false
     const onEvent = (e: AgentEvent) => {
-      if (e.type === "assistant_delta") {
+      if (e.type === "thinking_delta") {
+        if (!thinking) {
+          thinking = true
+          process.stdout.write("\n  thinking…\n")
+        }
+      } else if (e.type === "assistant_delta") {
         if (!streaming) {
-          process.stdout.write("\nanvil> ")
+          if (thinking) {
+            process.stdout.write("\n")
+            thinking = false
+          }
+          process.stdout.write("anvil> ")
           streaming = true
         }
         process.stdout.write(e.text ?? "")
       } else if (e.type === "assistant_text") {
-        if (streaming) process.stdout.write("\n")
+        if (thinking || streaming) process.stdout.write("\n")
         else console.log(`\nanvil> ${e.text}\n`)
+        thinking = false
         streaming = false
       } else if (e.type === "tool_start") {
         console.log(`  [tool] ${formatCall(e.toolName ?? "", e.input)}`)
       } else if (e.type === "denied") {
         console.log(`  [denied] ${e.toolName}: ${e.text}`)
+      } else if (e.type === "retry") {
+        console.error(`  [retry] ${e.text}`)
       } else if (e.type === "error") {
         console.error(`  [error] ${e.text}`)
       }

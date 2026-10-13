@@ -63,6 +63,9 @@
           </select>
           <span id="model" class="pill" title="Model">…</span>
           <span id="cwd" class="pill mono" title="Working directory">…</span>
+          <button id="settings-btn" class="icon-btn" title="Settings (provider, keys, model, thinking)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.58 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.65 8.86a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.08A1.7 1.7 0 0 0 10.12 3V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.08a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51.88z"/></svg>
+          </button>
           <button id="copy-link" class="icon-btn" title="Copy session link">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M10 14a4 4 0 0 0 6 .4l3-3a4 4 0 0 0-5.6-5.6l-1.7 1.7"/><path d="M14 10a4 4 0 0 0-6-.4l-3 3a4 4 0 0 0 5.6 5.6l1.7-1.7"/></svg>
           </button>
@@ -113,6 +116,57 @@
   </div>
 
   <div id="toasts" aria-live="polite"></div>
+
+  <div id="settings-backdrop" hidden></div>
+  <div id="settings" hidden role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="set-head">
+      <span id="settings-title">Settings</span>
+      <button id="settings-close" class="icon-btn" title="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="set-body">
+      <label class="set-field">
+        <span>Provider</span>
+        <select id="set-provider">
+          <option value="">auto (first key found)</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="openai">OpenAI</option>
+        </select>
+      </label>
+      <label class="set-field">
+        <span>Anthropic API key</span>
+        <input id="set-anthropic-key" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="set-field">
+        <span>OpenAI API key</span>
+        <input id="set-openai-key" type="password" placeholder="sk-…" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="set-field">
+        <span>OpenAI base URL (optional)</span>
+        <input id="set-openai-base" type="text" placeholder="https://api.openai.com/v1" spellcheck="false">
+      </label>
+      <label class="set-field">
+        <span>Model</span>
+        <input id="set-model" type="text" list="model-options" placeholder="default for the provider" spellcheck="false">
+      </label>
+      <datalist id="model-options"></datalist>
+      <label class="set-field">
+        <span>Thinking effort</span>
+        <select id="set-thinking">
+          <option value="off">off</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+        </select>
+      </label>
+    </div>
+    <div class="set-foot">
+      <span class="set-note">Applies to new sessions. Keys are stored in <span class="mono" id="set-config-path">~/.anvil.json</span>.</span>
+      <button id="set-save" type="button">Save</button>
+    </div>
+  </div>
+
   <script src="/app.js"></script>
 </body>
 </html>

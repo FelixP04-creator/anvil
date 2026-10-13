@@ -37,8 +37,16 @@ class DemoProvider implements Provider {
     this.script = script
   }
 
-  async complete(_req: ProviderRequest, onDelta: (t: string) => void): Promise<ProviderResponse> {
+  async complete(
+    _req: ProviderRequest,
+    onDelta: (t: string) => void,
+    _signal?: AbortSignal,
+    onThinking?: (t: string) => void,
+  ): Promise<ProviderResponse> {
     const resp = this.script.shift() ?? { text: "DONE", toolUse: [], stop: "end_turn" }
+    if (resp.thinking) {
+      for (let i = 0; i < resp.thinking.length; i += 24) onThinking?.(resp.thinking.slice(i, i + 24))
+    }
     if (resp.text) {
       for (let i = 0; i < resp.text.length; i += 18) onDelta(resp.text.slice(i, i + 18))
     }
@@ -71,8 +79,15 @@ async function main(): Promise<void> {
   const cwd = process.cwd()
 
   const provider = new DemoProvider([
-    // Turn 1 (finishes): two read-only tools, then a markdown answer.
-    { text: "", toolUse: [tu("d1", "Glob", { pattern: "src/**/*.ts" })], stop: "tool_use" },
+    // Turn 1 (finishes): a thinking step, two read-only tools, then a
+    // markdown answer.
+    {
+      thinking:
+        "The user wants an overview of the project layout. Fastest route: list all TypeScript sources with a Glob, then read the agent loop to ground the explanation in the actual code.",
+      text: "",
+      toolUse: [tu("d1", "Glob", { pattern: "src/**/*.ts" })],
+      stop: "tool_use",
+    },
     { text: "", toolUse: [tu("d2", "Read", { file_path: "src/agent.ts", limit: 25 })], stop: "tool_use" },
     { text: MARKDOWN_ANSWER, toolUse: [], stop: "end_turn" },
     // Turn 2 (stops at the permission prompt): track the work, then a
@@ -93,7 +108,7 @@ async function main(): Promise<void> {
     },
   ])
 
-  const server = new AnvilServer({ provider, model: "demo-model (mock)", cwd })
+  const server = new AnvilServer({ provider, kind: "anthropic", model: "demo-model (mock)", thinking: "medium", cwd })
   const actualPort = await server.listen(port)
   const base = `http://localhost:${actualPort}`
 

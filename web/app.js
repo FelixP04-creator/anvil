@@ -21,6 +21,11 @@ let streamBuf = ""
 let raf = 0
 let pinned = true // auto-scroll only while the user is near the bottom
 
+let thinkWrap = null // .msg.thinking element currently receiving deltas
+let thinkEl = null // its .think-body element
+let thinkNode = null // the single text node inside the body
+let thinkBuf = ""
+
 const openTools = new Map() // toolName -> queue of in-flight chip elements
 const renderedPerms = new Set() // permission ids already on screen
 const permCards = new Map() // permId -> { card, decided }
@@ -76,6 +81,7 @@ const ICONS = {
   caret: '<svg class="tool-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5.5l7 6.5-7 6.5"/></svg>',
   shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.8l7.5 2.8v5.6c0 4.8-3.2 8.6-7.5 10-4.3-1.4-7.5-5.2-7.5-10V5.6z"/><path d="M9.2 12l2 2 3.6-4"/></svg>',
   mark: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.8 4.4c.3-.3.8-.4 1.2-.4h12.3c1.6 0 3.1.5 4.3 1.4.5.3.6 1 .2 1.5l-.8 1c-1 1.2-2.4 2-4 2.4v2.1c0 .7-.5 1.2-1.2 1.2h-1.3v2.6c1.7.4 3 1.5 3.6 3.2.2.6-.2 1.2-.9 1.2H5.6c-.7 0-1.1-.6-.9-1.2.6-1.7 1.9-2.8 3.6-3.2v-2.6H7c-.7 0-1.2-.5-1.2-1.2v-2.1c-1.7-.5-3.2-1.6-4.3-3.1-.3-.5-.2-1.2.3-1.8z"/></svg>',
+  think: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4l1.6 4.4L18 10l-4.4 1.6L12 16l-1.6-4.4L6 10l4.4-1.6z"/><path d="M18.8 14.5l.9 2.3 2.3.9-2.3.9-.9 2.3-.9-2.3-2.3-.9 2.3-.9z"/></svg>',
 }
 
 // ---------------------------------------------------------------- markdown
@@ -478,24 +484,89 @@ function beginStream() {
   streamBuf = ""
 }
 
+/** Collapsible thinking block; open while streaming, collapsed after. */
+function beginThinking() {
+  const wrap = el("div", "msg thinking")
+  const head = el("div", "think-head")
+  head.innerHTML = ICONS.think
+  head.appendChild(el("span", "think-label", "thinking"))
+  const body = el("div", "think-body")
+  wrap.append(head, body)
+  wrap.dataset.open = "true"
+  head.addEventListener("click", () => {
+    wrap.dataset.open = wrap.dataset.open === "true" ? "false" : "true"
+  })
+  append(wrap)
+  thinkWrap = wrap
+  thinkEl = body
+  thinkNode = document.createTextNode("")
+  body.appendChild(thinkNode)
+  thinkBuf = ""
+}
+
+/** Static, collapsed thinking block (transcript replay). */
+function renderThinking(text) {
+  const wrap = el("div", "msg thinking")
+  wrap.dataset.open = "false"
+  const head = el("div", "think-head")
+  head.innerHTML = ICONS.think
+  head.appendChild(el("span", "think-label", `thought · ${fmtTokens(String(text).length)} chars`))
+  const body = el("div", "think-body", text)
+  wrap.append(head, body)
+  head.addEventListener("click", () => {
+    wrap.dataset.open = wrap.dataset.open === "true" ? "false" : "true"
+  })
+  append(wrap)
+}
+
 function onDelta(text) {
   if (!streamEl) beginStream()
   streamBuf += text
+  setStatus("working", "responding…")
+  if (!raf) raf = requestAnimationFrame(flushStream)
+}
+
+function onThinkingDelta(text) {
+  if (!thinkEl) beginThinking()
+  thinkBuf += text
+  setStatus("working", "thinking…")
   if (!raf) raf = requestAnimationFrame(flushStream)
 }
 
 function flushStream() {
   raf = 0
+  let changed = false
+  if (thinkNode && thinkBuf !== thinkNode.data) {
+    thinkNode.data = thinkBuf
+    changed = true
+  }
   if (streamNode && streamBuf !== streamNode.data) {
     streamNode.data = streamBuf
-    if (pinned) scrollBottom()
+    changed = true
   }
+  if (changed && pinned) scrollBottom()
+}
+
+function finalizeThinking() {
+  if (!thinkWrap) return
+  const label = thinkWrap.querySelector(".think-label")
+  if (label) label.textContent = `thought · ${fmtTokens(thinkBuf.length)} chars`
+  thinkWrap.dataset.open = "false"
+  thinkWrap = null
+  thinkEl = null
+  thinkNode = null
+  thinkBuf = ""
 }
 
 function endStream(finalText) {
   if (raf) {
     cancelAnimationFrame(raf)
     raf = 0
+  }
+  if (thinkWrap) {
+    const body = thinkWrap.querySelector(".think-body")
+    if (body) body.textContent = thinkBuf
+    finalizeThinking()
   }
   if (!streamEl) return
   const final = finalText !== undefined && finalText !== null ? finalText : streamBuf
@@ -548,9 +619,16 @@ function renderTodos(todos) {
   }
 }
 
+function setModelPill(s) {
+  const m = s.model ?? ""
+  $("model").textContent = m
+  $("model").title =
+    s.thinking && s.thinking !== "off" ? `${m} · thinking: ${s.thinking}` : m
+}
+
 function applyState(s) {
   $("session-title").textContent = s.title ?? "New session"
-  $("model").textContent = s.model ?? ""
+  setModelPill(s)
   $("cwd").textContent = s.cwd ?? ""
   $("cwd").title = s.cwd ?? ""
   $("empty-cwd").textContent = s.cwd ?? ""
@@ -646,7 +724,7 @@ async function openSession(id) {
 
   // Header + state (before touching the conversation).
   $("session-title").textContent = s.title ?? "New session"
-  $("model").textContent = s.model ?? ""
+  setModelPill(s)
   $("cwd").textContent = s.cwd ?? ""
   $("cwd").title = s.cwd ?? ""
   $("empty-cwd").textContent = s.cwd ?? ""
@@ -661,6 +739,10 @@ async function openSession(id) {
   renderedPerms.clear()
   permCards.clear()
   pinned = true
+  thinkWrap = null
+  thinkEl = null
+  thinkNode = null
+  thinkBuf = ""
 
   // Replay the transcript, then any pending permission prompt, in that
   // visual order — the SSE snapshot that follows is deduplicated.
@@ -682,6 +764,7 @@ async function openSession(id) {
 function renderTranscript(entries) {
   for (const e of entries) {
     if (e.role === "user") userMsg(e.text)
+    else if (e.role === "thinking") renderThinking(e.text)
     else if (e.role === "assistant") {
       const t = assistantMsg()
       t.innerHTML = renderMarkdown(e.text)
@@ -771,6 +854,12 @@ function handle(ev) {
       break
     case "assistant_text":
       endStream(ev.text)
+      break
+    case "thinking_delta":
+      onThinkingDelta(ev.text ?? "")
+      break
+    case "retry":
+      setStatus("working", ev.text ?? "retrying…")
       break
     case "tool_start":
       onToolStart(ev)
@@ -934,6 +1023,14 @@ function wireChrome() {
     }
   })
 
+  $("settings-btn").addEventListener("click", openSettings)
+  $("settings-close").addEventListener("click", closeSettings)
+  $("settings-backdrop").addEventListener("click", closeSettings)
+  $("set-save").addEventListener("click", saveSettings)
+  $("set-provider").addEventListener("change", () => {
+    fillModelSuggestions($("set-provider").value)
+  })
+
   $("jump").addEventListener("click", () => {
     pinned = true
     scrollBottom()
@@ -971,6 +1068,10 @@ function wireChrome() {
   }
 
   document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("settings").hidden) {
+      closeSettings()
+      return
+    }
     const inField = e.target.closest("input, textarea, select")
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault()
@@ -993,6 +1094,78 @@ function wireChrome() {
       if (card) card.querySelectorAll(".perm-actions button")[+e.key - 1]?.click()
     }
   })
+}
+
+// ---------------------------------------------------------------- settings
+
+const MODEL_SUGGESTIONS = {
+  anthropic: ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5", "claude-3-7-sonnet-latest"],
+  openai: ["gpt-5", "gpt-5-mini", "gpt-4o", "o3", "o4-mini"],
+}
+
+// Masked values shown when the modal opens; a key field is only sent back
+// when it differs from what was displayed (empty = clear the stored key).
+let settingsOrigins = {}
+
+function fillModelSuggestions(provider) {
+  const dl = $("model-options")
+  dl.innerHTML = ""
+  const list = MODEL_SUGGESTIONS[provider] ?? MODEL_SUGGESTIONS.anthropic
+  for (const m of list) dl.appendChild(el("option", null, m))
+}
+
+function openSettings() {
+  fetch("/api/config")
+    .then((r) => (r.ok ? r.json() : Promise.reject(r)))
+    .then((c) => {
+      settingsOrigins = {
+        "set-anthropic-key": c.anthropicKey ?? "",
+        "set-openai-key": c.openaiKey ?? "",
+      }
+      $("set-provider").value = c.provider ?? ""
+      $("set-anthropic-key").value = c.anthropicKey ?? ""
+      $("set-openai-key").value = c.openaiKey ?? ""
+      $("set-openai-base").value = c.openaiBaseUrl ?? ""
+      $("set-model").value = c.model ?? ""
+      $("set-thinking").value = c.thinking ?? "off"
+      fillModelSuggestions(c.provider)
+      $("set-config-path").textContent = c.configPath ?? "~/.anvil.json"
+      $("settings").hidden = false
+      $("settings-backdrop").hidden = false
+    })
+    .catch(() => toast("Could not load settings", "err"))
+}
+
+function closeSettings() {
+  $("settings").hidden = true
+  $("settings-backdrop").hidden = true
+}
+
+async function saveSettings() {
+  const ak = $("set-anthropic-key").value
+  const ok = $("set-openai-key").value
+  const patch = {
+    provider: $("set-provider").value,
+    model: $("set-model").value.trim(),
+    thinking: $("set-thinking").value,
+    openaiBaseUrl: $("set-openai-base").value.trim(),
+  }
+  if (ak !== settingsOrigins["set-anthropic-key"]) patch.anthropicKey = ak
+  if (ok !== settingsOrigins["set-openai-key"]) patch.openaiKey = ok
+
+  const res = await fetch("/api/config", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  }).catch(() => null)
+  if (!res || !res.ok) {
+    const err = res ? (await res.json().catch(() => ({}))) : {}
+    toast(err.error ?? "Could not save settings", "err")
+    return
+  }
+  const body = await res.json().catch(() => ({}))
+  closeSettings()
+  toast(body.note ?? "Settings saved — applies to new sessions", "ok")
 }
 
 // ---------------------------------------------------------------- init

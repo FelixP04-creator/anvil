@@ -12,7 +12,7 @@ done — with a permission system that keeps you in control.
 > endorsed by Anthropic or OpenAI.
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="anvil web UI: session sidebar with live todo panel, streamed markdown answer with syntax highlighting, compact tool chips, and a red stop button" width="900">
+  <img src="docs/screenshot.png" alt="anvil web UI: a collapsible thinking block above compact tool chips and a streamed markdown answer with syntax-highlighted code" width="900">
 </p>
 
 ## Features
@@ -20,9 +20,19 @@ done — with a permission system that keeps you in control.
 - **Agent loop with streaming** — the model proposes tool calls, anvil
   executes them, results go back to the model, until the task is done or the
   turn limit is hit. Model text is streamed token by token (CLI and web).
+- **Robust loop** — transient provider errors (rate limits, overloads, network
+  blips) are retried with exponential backoff, and a reply cut off by the
+  token limit is continued automatically instead of being handed back
+  truncated.
 - **Two providers** — Anthropic Messages API and any OpenAI-compatible
-  endpoint (`OPENAI_BASE_URL`), selected by `--provider` or by which API key
-  is set.
+  endpoint (`OPENAI_BASE_URL`), selected by `--provider`, the settings dialog,
+  or by which API key is set.
+- **Model & thinking settings** — choose the model and an extended-thinking
+  effort (`off` / `low` / `medium` / `high`) in the web UI settings dialog,
+  via `anvil config`, a CLI flag, or environment variables. Effort maps to
+  Anthropic thinking budgets and OpenAI `reasoning_effort`; thinking streams
+  back as its own collapsible block in the UI and is kept in the conversation
+  history as the APIs require.
 - **Core tools** — `Read`, `Write`, `Edit` (exact-match replacement), `Bash`,
   `Glob`, `Grep`, `TodoWrite`, and `Task` (subagents with their own context
   window).
@@ -36,7 +46,8 @@ done — with a permission system that keeps you in control.
   a modern web interface: streamed markdown answers with syntax-highlighted
   code blocks, a session sidebar with auto-titles and status dots, a live
   todo panel, collapsible tool-call chips, in-browser permission prompts,
-  light/dark themes, and a red stop button that aborts a running turn.
+  a settings dialog for provider/keys/model/thinking, light/dark themes, and
+  a red stop button that aborts a running turn.
 - **Multi-turn sessions** — the CLI REPL and web sessions keep the full
   conversation history across turns.
 
@@ -49,10 +60,16 @@ Requires **Node.js ≥ 23.6** (native TypeScript — no build step, no runtime d
 ```sh
 npm install -g anvil-code
 
-export ANTHROPIC_API_KEY=sk-ant-...   # or: export OPENAI_API_KEY=...
+anvil config set anthropic-key sk-ant-...      # store your key once (or use env vars)
+anvil config set model claude-sonnet-4-5       # optional: pick model + thinking
+anvil config set thinking medium
 anvil "fix the failing test in test/auth.test.ts"
 anvil                                  # interactive session
 ```
+
+API keys can also come from environment variables (`ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`) or from the web UI settings dialog — see
+[Configuration](#configuration) for the precedence.
 
 **From a checkout** (no install needed):
 
@@ -88,6 +105,15 @@ The permission mode can be switched live in the header.
 - **Stop** — while a turn is running the send button turns red; clicking it
   (or pressing `Esc`) aborts the turn: the in-flight model call is cancelled
   and a pending permission prompt is resolved as denied.
+- **Thinking** — when extended thinking is enabled, the model's reasoning
+  streams into a collapsible "thinking" block (open while it runs, collapsed
+  afterwards with a size badge). Thinking is also part of the transcript
+  replay. The model pill in the header shows the active thinking level.
+- **Settings** — the gear icon in the header opens a settings dialog:
+  provider (auto/Anthropic/OpenAI), API keys (shown masked; leave untouched to
+  keep the stored key, clear it to remove it), OpenAI base URL, model (with
+  suggestions, free text allowed), and thinking effort. Changes are stored in
+  `~/.anvil.json` and apply to new sessions.
 - **Todos** — the sidebar shows the session's live todo list (as maintained by
   the `TodoWrite` tool), with a `done/total` counter.
 - **Themes & keys** — dark (default) or light theme, remembered per browser;
@@ -107,48 +133,85 @@ node scripts/demo-server.ts        # prints a ready-made session URL
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/api/health` | liveness + version |
-| `POST` | `/api/sessions` | create a session (`{ "mode": "default" }`) |
+| `GET` | `/api/config` | current settings; API keys masked, never raw |
+| `PUT` | `/api/config` | update `provider`, `model`, `thinking`, `anthropicKey`, `openaiKey`, `openaiBaseUrl` (empty string clears a field); persisted to `~/.anvil.json` |
+| `POST` | `/api/sessions` | create a session (`{ "mode", "model", "thinking" }`, all optional) |
 | `GET` | `/api/sessions` | list sessions (auto title, mode, busy, turns, permission-pending) |
-| `GET` | `/api/sessions/:id` | state: title, mode, busy, todos, usage, turns, pending permission |
+| `GET` | `/api/sessions/:id` | state: title, model, thinking, mode, busy, todos, usage, turns, pending permission |
 | `DELETE` | `/api/sessions/:id` | delete a session (aborts a running turn first) |
-| `GET` | `/api/sessions/:id/transcript` | renderable replay of everything that happened |
+| `GET` | `/api/sessions/:id/transcript` | renderable replay of everything that happened (incl. thinking) |
 | `POST` | `/api/sessions/:id/messages` | `{ "text": "…" }` → starts a turn (202) |
 | `POST` | `/api/sessions/:id/abort` | stop the running turn (`{ "stopped": true }`) |
 | `GET` | `/api/sessions/:id/events` | SSE stream of agent events |
 | `POST` | `/api/sessions/:id/permissions` | `{ "id": "perm-1", "answer": "once" }` |
 | `POST` | `/api/sessions/:id/mode` | `{ "mode": "plan" }` |
 
-SSE events: `session`, `assistant_delta`, `assistant_text`, `tool_start`,
-`tool_end`, `permission_request`, `permission_resolved`, `denied`, `error`,
-`aborted`, `todos`, `turn_end`, `mode_changed`.
+SSE events: `session`, `assistant_delta`, `assistant_text`, `thinking_delta`,
+`tool_start`, `tool_end`, `permission_request`, `permission_resolved`,
+`denied`, `retry`, `error`, `aborted`, `todos`, `turn_end`, `mode_changed`.
 
 ## Configuration
 
-| Variable / file | Purpose |
+Settings are resolved in this order (highest wins):
+
+1. CLI flags / explicit API overrides
+2. environment variables
+3. the config file (`~/.anvil.json`, override the path with `$ANVIL_CONFIG`)
+4. built-in defaults (e.g. `claude-sonnet-4-5` / `gpt-4o`)
+
+**Config file** — edited through `anvil config set <field> <value>` (also
+`unset`), the web UI settings dialog, or by hand. Fields: `provider`
+(`anthropic` | `openai`), `model`, `thinking` (`off` | `low` | `medium` |
+`high`), `anthropicKey`, `openaiKey`, `openaiBaseUrl`. Keys are written with
+mode `0600`; every API surface that displays them (CLI, `GET /api/config`,
+UI) shows them masked.
+
+**CLI:**
+
+```sh
+anvil config                        # show settings (keys masked)
+anvil config set anthropic-key sk-ant-...
+anvil config set openai-key sk-...
+anvil config set model gpt-5
+anvil config set thinking high
+anvil config unset openai-key
+anvil --thinking high "explain this architecture decision"
+```
+
+**Environment variables:**
+
+| Variable | Purpose |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | anthropic provider |
-| `OPENAI_API_KEY` | openai provider |
+| `ANTHROPIC_API_KEY` | anthropic provider key |
+| `OPENAI_API_KEY` | openai provider key |
 | `OPENAI_BASE_URL` | OpenAI-compatible gateway (default `https://api.openai.com/v1`) |
 | `ANVIL_MODEL` / `OPENAI_MODEL` | default model per provider |
+| `ANVIL_CONFIG` | config file location (default `~/.anvil.json`) |
 | `ANVIL.md` (working dir) | project memory, loaded into the prompt |
 | `~/.anvil/ANVIL.md` | user memory, loaded into the prompt |
+
+**Thinking effort** is sent only where it applies: Anthropic receives
+`thinking.budget_tokens` (4k/16k/32k for low/medium/high) on thinking-capable
+Claude models, OpenAI receives `reasoning_effort` on o-series/gpt-5 models;
+for other models the setting is ignored, not an error.
 
 ## Architecture
 
 ```
 src/
-├── index.ts            CLI: arg parsing, one-shot / interactive / server
+├── index.ts            CLI: arg parsing, one-shot / interactive / server / config
 ├── repl.ts             interactive loop: streamed output, permission prompts
-├── server.ts           REST + SSE server, sessions, static web UI
-├── agent.ts            the agent loop (model ⇄ tools), event emission
+├── server.ts           REST + SSE server, sessions, settings API, static web UI
+├── agent.ts            the agent loop (model ⇄ tools), retry + continuation
 ├── permissions.ts      permission modes + ask/always/deny rules
 ├── prompt.ts           original system prompts + environment detection
+├── config.ts           settings: ~/.anvil.json, key/model/thinking resolution
 ├── memory.ts           ANVIL.md loading (project + user)
-├── types.ts            shared types (Tool, Provider, messages)
+├── types.ts            shared types (Tool, Provider, messages, thinking)
 ├── providers/
-│   ├── index.ts        provider factory (flag or key detection)
-│   ├── anthropic.ts    Messages API, SSE streaming, no SDK
-│   └── openai.ts       chat completions, SSE streaming, tool-calls
+│   ├── index.ts        provider kinds + defaults
+│   ├── anthropic.ts    Messages API, SSE streaming, extended thinking, no SDK
+│   └── openai.ts       chat completions, SSE streaming, reasoning_effort
 └── tools/
     ├── read.ts  write.ts  edit.ts  bash.ts  glob.ts  grep.ts
     ├── todo.ts         todo list (exactly one in_progress at a time)
@@ -162,16 +225,19 @@ scripts/
 └── demo-server.ts              web UI demo, no API key needed
 test/
 ├── smoke.ts            agent loop, tools, permissions (mock provider)
-└── server-smoke.ts     HTTP server: sessions, SSE, permission round-trip
+└── server-smoke.ts     HTTP server: sessions, SSE, permission flow, settings
 ```
 
 **Agent loop** (`agent.ts`): the conversation history is a plain array of
 messages kept by the caller (REPL, web session, subagent). Each turn sends
-`system + messages + tool schemas` to the provider; streamed text deltas are
-forwarded as events. If the reply contains tool calls, each one goes through
-the permission engine, is executed, and the results are appended as
-`tool_result` blocks. The loop ends when the model replies with plain text or
-`maxTurns` is reached.
+`system + messages + tool schemas` to the provider; streamed text and
+thinking deltas are forwarded as events. If the reply contains tool calls,
+each one goes through the permission engine, is executed, and the results are
+appended as `tool_result` blocks. The loop ends when the model replies with
+plain text or `maxTurns` is reached. Two robustness layers wrap each
+completion: transient API errors are retried with backoff (only while nothing
+has been streamed yet), and a `max_tokens` cutoff without tool calls triggers
+an automatic "continue where you stopped" round (a few at most).
 
 **Permissions** (`permissions.ts`): read-only tools never ask. In `default`
 mode every new tool — or, for Bash, every new two-word command prefix —

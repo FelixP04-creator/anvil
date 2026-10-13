@@ -1,7 +1,9 @@
 // OpenAI-compatible chat-completions provider with SSE streaming.
 // Works with api.openai.com and compatible gateways (set OPENAI_BASE_URL).
+// Supports reasoning models: reasoning_effort is sent for o-series/gpt-5
+// models, and streamed reasoning text (reasoning_content) is surfaced.
 
-import type { Message, Provider, ProviderRequest, ProviderResponse, ToolInput } from "../types.ts"
+import type { Message, Provider, ProviderRequest, ProviderResponse, ToolInput, ThinkingEffort } from "../types.ts"
 
 interface ToolCallAcc {
   id: string
@@ -9,7 +11,22 @@ interface ToolCallAcc {
   args: string
 }
 
-/** Convert anvil's internal messages to the OpenAI chat format. */
+/** Models that accept reasoning_effort (o-series, gpt-5 family). */
+function isReasoningModel(model: string): boolean {
+  const m = model.toLowerCase()
+  return /^o\d/.test(m) || m.startsWith("gpt-5")
+}
+
+/** Map anvil's effort to the API value; "off" → no override. o1 caps at
+ *  medium. Non-reasoning models → undefined (parameter omitted). */
+function reasoningEffortFor(model: string, effort: ThinkingEffort): "low" | "medium" | "high" | undefined {
+  if (effort === "off" || !isReasoningModel(model)) return undefined
+  if (/^o1/.test(model.toLowerCase()) && effort === "high") return "medium"
+  return effort
+}
+
+/** Convert anvil's internal messages to the OpenAI chat format. Thinking
+ *  blocks are not part of the OpenAI history format and are skipped. */
 function toOpenAIMessages(messages: Message[]): any[] {
   const out: any[] = []
   for (const m of messages) {
@@ -60,7 +77,26 @@ export class OpenAIProvider implements Provider {
     req: ProviderRequest,
     onDelta: (text: string) => void,
     signal?: AbortSignal,
+    onThinking?: (text: string) => void,
   ): Promise<ProviderResponse> {
+    const reasoning = isReasoningModel(req.model)
+    const body: Record<string, unknown> = {
+      model: req.model,
+      stream: true,
+      // gpt-5/o-series use max_completion_tokens; older models use max_tokens.
+      ...(reasoning ? { max_completion_tokens: req.maxTokens } : { max_tokens: req.maxTokens }),
+      messages: [
+        { role: "system", content: req.system },
+        ...toOpenAIMessages(req.messages),
+      ],
+      tools: req.tools.map((t) => ({
+        type: "function",
+        function: { name: t.name, description: t.description, parameters: t.inputSchema },
+      })),
+    }
+    const effort = reasoningEffortFor(req.model, req.thinking ?? "off")
+    if (effort) body.reasoning_effort = effort
+
     const res = await fetch(`${this.baseUrl}/chat/completions`, {
       method: "POST",
       signal,
@@ -68,30 +104,20 @@ export class OpenAIProvider implements Provider {
         "content-type": "application/json",
         authorization: `Bearer ${this.apiKey}`,
       },
-      body: JSON.stringify({
-        model: req.model,
-        stream: true,
-        max_tokens: req.maxTokens,
-        messages: [
-          { role: "system", content: req.system },
-          ...toOpenAIMessages(req.messages),
-        ],
-        tools: req.tools.map((t) => ({
-          type: "function",
-          function: { name: t.name, description: t.description, parameters: t.inputSchema },
-        })),
-      }),
+      body: JSON.stringify(body),
     })
 
     if (!res.ok || !res.body) {
-      const body = await res.text().catch(() => "")
-      throw new Error(`OpenAI API error ${res.status}: ${body.slice(0, 500)}`)
+      const errBody = await res.text().catch(() => "")
+      throw new Error(`OpenAI API error ${res.status}: ${errBody.slice(0, 500)}`)
     }
 
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ""
     let text = ""
+    let thought = ""
+    let finishReason = ""
     const toolCalls = new Map<number, ToolCallAcc>()
 
     const handleData = (data: string) => {
@@ -104,10 +130,15 @@ export class OpenAIProvider implements Provider {
       }
       const choice = msg.choices?.[0]
       const delta = choice?.delta
+      if (choice?.finish_reason) finishReason = choice.finish_reason
       if (!delta) return
       if (typeof delta.content === "string" && delta.content.length > 0) {
         text += delta.content
         onDelta(delta.content)
+      }
+      if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+        thought += delta.reasoning_content
+        onThinking?.(delta.reasoning_content)
       }
       for (const tc of delta.tool_calls ?? []) {
         const acc = toolCalls.get(tc.index) ?? { id: "", name: "", args: "" }
@@ -147,8 +178,9 @@ export class OpenAIProvider implements Provider {
 
     return {
       text,
+      thinking: thought || undefined,
       toolUse,
-      stop: toolUse.length ? "tool_use" : "end_turn",
+      stop: toolUse.length ? "tool_use" : finishReason === "length" ? "max_tokens" : "end_turn",
     }
   }
 }
