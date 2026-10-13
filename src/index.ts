@@ -32,8 +32,8 @@ usage:
   anvil config [command]           show or change persistent settings
 
 options:
-  --provider <kind>     anthropic | openai (default: whichever API key is set)
-  --model <id>          model id (default: $ANVIL_MODEL / $OPENAI_MODEL or per-provider default)
+  --provider <kind>     anthropic | openai | hsnr (default: whichever API key is set)
+  --model <id>          model id (default: per-provider default, e.g. Qwen/Qwen3.8-27B for hsnr)
   --thinking <level>    off | low | medium | high (extended thinking, default: off)
   --mode <mode>         default | acceptEdits | plan | bypass (default: default)
   --max-turns <n>       agent turn limit (default: 50)
@@ -47,7 +47,8 @@ server options:
 config commands:
   anvil config                       show settings (keys masked)
   anvil config set <field> <value>   set provider | model | thinking |
-                                     anthropic-key | openai-key | openai-base-url
+                                     anthropic-key | openai-key | openai-base-url |
+                                     hsnr-key | hsnr-base-url
   anvil config unset <field>         remove a field
 
 settings are stored in ~/.anvil.json. Resolution order:
@@ -56,19 +57,32 @@ settings are stored in ~/.anvil.json. Resolution order:
 environment:
   ANTHROPIC_API_KEY     API key for the anthropic provider
   OPENAI_API_KEY        API key for the openai provider
+  OWUI_API_KEY          API key for the hsnr provider
   OPENAI_BASE_URL       OpenAI-compatible gateway base (default: https://api.openai.com/v1)
-  ANVIL_MODEL           default model for the anthropic provider
+  HSNR_BASE_URL         hsnr gateway base (default: https://ai.ide3.de/openai)
+  ANVIL_MODEL           default model for the anthropic/hsnr provider
   OPENAI_MODEL          default model for the openai provider
   ANVIL_CONFIG          config file location (default: ~/.anvil.json)`)
 }
 
-const CONFIG_FIELDS = ["provider", "model", "thinking", "anthropic-key", "openai-key", "openai-base-url"] as const
+const CONFIG_FIELDS = [
+  "provider",
+  "model",
+  "thinking",
+  "anthropic-key",
+  "openai-key",
+  "openai-base-url",
+  "hsnr-key",
+  "hsnr-base-url",
+] as const
 type ConfigField = (typeof CONFIG_FIELDS)[number]
 
 function fieldToKey(field: ConfigField): keyof FileConfig {
   if (field === "anthropic-key") return "anthropicKey"
   if (field === "openai-key") return "openaiKey"
   if (field === "openai-base-url") return "openaiBaseUrl"
+  if (field === "hsnr-key") return "hsnrKey"
+  if (field === "hsnr-base-url") return "hsnrBaseUrl"
   return field
 }
 
@@ -87,6 +101,8 @@ function runConfigCommand(args: string[]): void {
     line("anthropic-key", file.anthropicKey, true)
     line("openai-key", file.openaiKey, true)
     line("openai-base-url", file.openaiBaseUrl, false)
+    line("hsnr-key", file.hsnrKey, true)
+    line("hsnr-base-url", file.hsnrBaseUrl, false)
     console.log("")
     try {
       const s = resolveSettings()
@@ -112,8 +128,13 @@ function runConfigCommand(args: string[]): void {
       console.error(`usage: anvil config set ${field} <value>`)
       process.exit(1)
     }
-    if (field === "provider" && value !== "anthropic" && value !== "openai") {
-      console.error(`provider must be one of: anthropic | openai`)
+    if (
+      field === "provider" &&
+      value !== "anthropic" &&
+      value !== "openai" &&
+      value !== "hsnr"
+    ) {
+      console.error(`provider must be one of: anthropic | openai | hsnr`)
       process.exit(1)
     }
     if (field === "thinking" && !THINKING_LEVELS.includes(value as ThinkingEffort)) {

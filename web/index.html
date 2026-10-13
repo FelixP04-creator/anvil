@@ -132,6 +132,7 @@
           <option value="">auto (first key found)</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai">OpenAI</option>
+          <option value="hsnr">HSNR (ai.ide3.de)</option>
         </select>
       </label>
       <label class="set-field">
@@ -145,6 +146,14 @@
       <label class="set-field">
         <span>OpenAI base URL (optional)</span>
         <input id="set-openai-base" type="text" placeholder="https://api.openai.com/v1" spellcheck="false">
+      </label>
+      <label class="set-field" id="hsnr-fields-key" hidden>
+        <span>HSNR API key</span>
+        <input id="set-hsnr-key" type="password" placeholder="sk-…" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="set-field" id="hsnr-fields-base" hidden>
+        <span>HSNR base URL (optional)</span>
+        <input id="set-hsnr-base" type="text" placeholder="https://ai.ide3.de/openai" spellcheck="false">
       </label>
       <label class="set-field">
         <span>Model</span>

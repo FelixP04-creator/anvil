@@ -1,7 +1,8 @@
 // OpenAI-compatible chat-completions provider with SSE streaming.
 // Works with api.openai.com and compatible gateways (set OPENAI_BASE_URL).
 // Supports reasoning models: reasoning_effort is sent for o-series/gpt-5
-// models, and streamed reasoning text (reasoning_content) is surfaced.
+// models (or all models when forceReasoning is set, as on the hsnr gateway),
+// and streamed reasoning text (reasoning_content) is surfaced.
 
 import type { Message, Provider, ProviderRequest, ProviderResponse, ToolInput, ThinkingEffort } from "../types.ts"
 
@@ -18,10 +19,15 @@ function isReasoningModel(model: string): boolean {
 }
 
 /** Map anvil's effort to the API value; "off" → no override. o1 caps at
- *  medium. Non-reasoning models → undefined (parameter omitted). */
-function reasoningEffortFor(model: string, effort: ThinkingEffort): "low" | "medium" | "high" | undefined {
-  if (effort === "off" || !isReasoningModel(model)) return undefined
-  if (/^o1/.test(model.toLowerCase()) && effort === "high") return "medium"
+ *  medium. Non-reasoning models → undefined (parameter omitted), unless the
+ *  gateway forces reasoning on all models. */
+function reasoningEffortFor(
+  model: string,
+  effort: ThinkingEffort,
+  forceReasoning = false,
+): "low" | "medium" | "high" | undefined {
+  if (effort === "off" || (!forceReasoning && !isReasoningModel(model))) return undefined
+  if (!forceReasoning && /^o1/.test(model.toLowerCase()) && effort === "high") return "medium"
   return effort
 }
 
@@ -67,10 +73,13 @@ export class OpenAIProvider implements Provider {
   name = "openai"
   apiKey: string
   baseUrl: string
+  /** Gateways where every model takes reasoning_effort (e.g. hsnr). */
+  forceReasoning: boolean
 
-  constructor(apiKey: string, baseUrl = "https://api.openai.com/v1") {
+  constructor(apiKey: string, baseUrl = "https://api.openai.com/v1", forceReasoning = false) {
     this.apiKey = apiKey
     this.baseUrl = baseUrl
+    this.forceReasoning = forceReasoning
   }
 
   async complete(
@@ -79,7 +88,7 @@ export class OpenAIProvider implements Provider {
     signal?: AbortSignal,
     onThinking?: (text: string) => void,
   ): Promise<ProviderResponse> {
-    const reasoning = isReasoningModel(req.model)
+    const reasoning = this.forceReasoning || isReasoningModel(req.model)
     const body: Record<string, unknown> = {
       model: req.model,
       stream: true,
@@ -94,7 +103,7 @@ export class OpenAIProvider implements Provider {
         function: { name: t.name, description: t.description, parameters: t.inputSchema },
       })),
     }
-    const effort = reasoningEffortFor(req.model, req.thinking ?? "off")
+    const effort = reasoningEffortFor(req.model, req.thinking ?? "off", this.forceReasoning)
     if (effort) body.reasoning_effort = effort
 
     const res = await fetch(`${this.baseUrl}/chat/completions`, {

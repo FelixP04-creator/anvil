@@ -71,6 +71,8 @@ async function main(): Promise<void> {
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
+    "OWUI_API_KEY",
+    "HSNR_BASE_URL",
     "ANVIL_MODEL",
     "OPENAI_MODEL",
   ]) {
@@ -287,6 +289,30 @@ async function main(): Promise<void> {
     "creation response carries override",
     createdB.model === "custom-model" && createdB.thinking === "medium",
   )
+
+  // hsnr: an OpenAI-compatible gateway provider with its own key env var
+  // (OWUI_API_KEY), default model and fixed lineup.
+  process.env.OWUI_API_KEY = "owui-test-key-abcdefgh1234"
+  const cfgPutHsnr = await fetch(`${base}/api/config`, {
+    method: "PUT",
+    headers: jsonHdr,
+    body: JSON.stringify({ provider: "hsnr", model: "" }),
+  })
+  check("hsnr config saved (200)", cfgPutHsnr.status === 200)
+  const cfgHsnr = await (await fetch(`${base}/api/config`)).json()
+  check("hsnr provider resolved from env key", cfgHsnr.provider === "hsnr")
+  check("hsnr key flagged in view", cfgHsnr.hasHsnrKey === true)
+  check("hsnr key masked in view", cfgHsnr.hsnrKey === "owui-te…1234", String(cfgHsnr.hsnrKey))
+  check("hsnr default model picked", cfgHsnr.model === "Qwen/Qwen3.8-27B", cfgHsnr.model)
+  const cfgHsnr2 = await fetch(`${base}/api/config`, {
+    method: "PUT",
+    headers: jsonHdr,
+    body: JSON.stringify({ model: "ultrabrain", thinking: "medium" }),
+  })
+  check("hsnr model override saved", cfgHsnr2.status === 200)
+  const cfgHsnr3 = await (await fetch(`${base}/api/config`)).json()
+  check("hsnr model override reflected", cfgHsnr3.model === "ultrabrain" && cfgHsnr3.thinking === "medium")
+  delete process.env.OWUI_API_KEY
 
   // Saving model/thinking works even after the key is gone (no provider can
   // be resolved); the values are kept and shown until a key is set again.

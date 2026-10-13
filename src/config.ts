@@ -3,8 +3,9 @@
 // Stored as JSON in ~/.anvil.json (override the location with $ANVIL_CONFIG).
 // Resolution order, highest first:
 //   1. CLI flags / explicit overrides passed by the caller
-//   2. environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY, ANVIL_MODEL,
-//      OPENAI_MODEL, OPENAI_BASE_URL)
+//   2. environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY,
+//      OWUI_API_KEY, ANVIL_MODEL, OPENAI_MODEL, OPENAI_BASE_URL,
+//      HSNR_BASE_URL)
 //   3. the config file
 //   4. built-in defaults
 
@@ -14,7 +15,7 @@ import { dirname, join } from "node:path"
 
 import type { Provider, ThinkingEffort } from "./types.ts"
 import type { ProviderKind } from "./providers/index.ts"
-import { defaultModelFor } from "./providers/index.ts"
+import { defaultModelFor, HSNR_DEFAULT_BASE_URL } from "./providers/index.ts"
 import { AnthropicProvider } from "./providers/anthropic.ts"
 import { OpenAIProvider } from "./providers/openai.ts"
 
@@ -27,6 +28,8 @@ export interface FileConfig {
   anthropicKey?: string
   openaiKey?: string
   openaiBaseUrl?: string
+  hsnrKey?: string
+  hsnrBaseUrl?: string
 }
 
 export interface SettingsOverride {
@@ -81,7 +84,14 @@ export function maskKey(key: string | undefined): string | null {
 
 function keyFor(kind: ProviderKind, file: FileConfig): string | undefined {
   if (kind === "anthropic") return process.env.ANTHROPIC_API_KEY || file.anthropicKey
+  if (kind === "hsnr") return process.env.OWUI_API_KEY || file.hsnrKey
   return process.env.OPENAI_API_KEY || file.openaiKey
+}
+
+function keyEnvFor(kind: ProviderKind): string {
+  if (kind === "anthropic") return "ANTHROPIC_API_KEY"
+  if (kind === "hsnr") return "OWUI_API_KEY"
+  return "OPENAI_API_KEY"
 }
 
 /**
@@ -99,33 +109,42 @@ export function resolveSettings(ov: SettingsOverride = {}): ResolvedSettings {
         ? "anthropic"
         : process.env.OPENAI_API_KEY || file.openaiKey
           ? "openai"
-          : undefined
+          : process.env.OWUI_API_KEY || file.hsnrKey
+            ? "hsnr"
+            : undefined
   }
   if (!kind) {
     throw new Error(
-      "No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or store one with `anvil config set <anthropic-key|openai-key> <key>` (or in the web UI settings).",
+      "No API key found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY or OWUI_API_KEY, or store one with `anvil config set <anthropic-key|openai-key|hsnr-key> <key>` (or in the web UI settings).",
     )
   }
   const key = keyFor(kind, file)
   if (!key) {
     throw new Error(
-      `The provider "${kind}" is selected but no API key is set. Set ${
-        kind === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"
-      } or \`anvil config set ${kind}-key <key>\`.`,
+      `The provider "${kind}" is selected but no API key is set. Set ${keyEnvFor(
+        kind,
+      )} or \`anvil config set ${kind}-key <key>\`.`,
     )
   }
 
-  const envModel = kind === "anthropic" ? process.env.ANVIL_MODEL : process.env.OPENAI_MODEL
+  const envModel =
+    kind === "openai" ? process.env.OPENAI_MODEL : kind === "anthropic" ? process.env.ANVIL_MODEL : process.env.ANVIL_MODEL
   const model = ov.model || envModel || file.model || defaultModelFor(kind)
   const thinking = ov.thinking ?? file.thinking ?? "off"
 
   const provider: Provider =
     kind === "anthropic"
       ? new AnthropicProvider(key)
-      : new OpenAIProvider(
-          key,
-          process.env.OPENAI_BASE_URL || file.openaiBaseUrl || "https://api.openai.com/v1",
-        )
+      : kind === "hsnr"
+        ? new OpenAIProvider(
+            key,
+            process.env.HSNR_BASE_URL || file.hsnrBaseUrl || HSNR_DEFAULT_BASE_URL,
+            true,
+          )
+        : new OpenAIProvider(
+            key,
+            process.env.OPENAI_BASE_URL || file.openaiBaseUrl || "https://api.openai.com/v1",
+          )
 
   return { kind, model, thinking, provider, file }
 }

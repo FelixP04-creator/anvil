@@ -24,9 +24,10 @@ done — with a permission system that keeps you in control.
   blips) are retried with exponential backoff, and a reply cut off by the
   token limit is continued automatically instead of being handed back
   truncated.
-- **Two providers** — Anthropic Messages API and any OpenAI-compatible
-  endpoint (`OPENAI_BASE_URL`), selected by `--provider`, the settings dialog,
-  or by which API key is set.
+- **Three providers** — Anthropic Messages API, any OpenAI-compatible
+  endpoint (`OPENAI_BASE_URL`), and the HSNR gateway (`ai.ide3.de`, models
+  `Qwen/Qwen3.8-27B`, `zai-org/GLM-5.3`, `ultrabrain`, `smallbrain`), selected
+  by `--provider`, the settings dialog, or by which API key is set.
 - **Model & thinking settings** — choose the model and an extended-thinking
   effort (`off` / `low` / `medium` / `high`) in the web UI settings dialog,
   via `anvil config`, a CLI flag, or environment variables. Effort maps to
@@ -161,8 +162,9 @@ Settings are resolved in this order (highest wins):
 
 **Config file** — edited through `anvil config set <field> <value>` (also
 `unset`), the web UI settings dialog, or by hand. Fields: `provider`
-(`anthropic` | `openai`), `model`, `thinking` (`off` | `low` | `medium` |
-`high`), `anthropicKey`, `openaiKey`, `openaiBaseUrl`. Keys are written with
+(`anthropic` | `openai` | `hsnr`), `model`, `thinking` (`off` | `low` |
+`medium` | `high`), `anthropicKey`, `openaiKey`, `openaiBaseUrl`, `hsnrKey`,
+`hsnrBaseUrl`. Keys are written with
 mode `0600`; every API surface that displays them (CLI, `GET /api/config`,
 UI) shows them masked.
 
@@ -172,6 +174,7 @@ UI) shows them masked.
 anvil config                        # show settings (keys masked)
 anvil config set anthropic-key sk-ant-...
 anvil config set openai-key sk-...
+anvil config set hsnr-key sk-...
 anvil config set model gpt-5
 anvil config set thinking high
 anvil config unset openai-key
@@ -184,7 +187,9 @@ anvil --thinking high "explain this architecture decision"
 | --- | --- |
 | `ANTHROPIC_API_KEY` | anthropic provider key |
 | `OPENAI_API_KEY` | openai provider key |
+| `OWUI_API_KEY` | hsnr provider key |
 | `OPENAI_BASE_URL` | OpenAI-compatible gateway (default `https://api.openai.com/v1`) |
+| `HSNR_BASE_URL` | hsnr gateway (default `https://ai.ide3.de/openai`) |
 | `ANVIL_MODEL` / `OPENAI_MODEL` | default model per provider |
 | `ANVIL_CONFIG` | config file location (default `~/.anvil.json`) |
 | `ANVIL.md` (working dir) | project memory, loaded into the prompt |
@@ -192,8 +197,9 @@ anvil --thinking high "explain this architecture decision"
 
 **Thinking effort** is sent only where it applies: Anthropic receives
 `thinking.budget_tokens` (4k/16k/32k for low/medium/high) on thinking-capable
-Claude models, OpenAI receives `reasoning_effort` on o-series/gpt-5 models;
-for other models the setting is ignored, not an error.
+Claude models, OpenAI receives `reasoning_effort` on o-series/gpt-5 models,
+and the hsnr gateway receives `reasoning_effort` on all of its models;
+elsewhere the setting is ignored, not an error.
 
 ## Architecture
 

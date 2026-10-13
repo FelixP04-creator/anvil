@@ -1029,6 +1029,7 @@ function wireChrome() {
   $("set-save").addEventListener("click", saveSettings)
   $("set-provider").addEventListener("change", () => {
     fillModelSuggestions($("set-provider").value)
+    updateHsnrFields()
   })
 
   $("jump").addEventListener("click", () => {
@@ -1101,11 +1102,18 @@ function wireChrome() {
 const MODEL_SUGGESTIONS = {
   anthropic: ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5", "claude-3-7-sonnet-latest"],
   openai: ["gpt-5", "gpt-5-mini", "gpt-4o", "o3", "o4-mini"],
+  hsnr: ["Qwen/Qwen3.8-27B", "zai-org/GLM-5.3", "ultrabrain", "smallbrain"],
 }
 
 // Masked values shown when the modal opens; a key field is only sent back
 // when it differs from what was displayed (empty = clear the stored key).
 let settingsOrigins = {}
+
+function updateHsnrFields() {
+  const on = $("set-provider").value === "hsnr"
+  $("hsnr-fields-key").hidden = !on
+  $("hsnr-fields-base").hidden = !on
+}
 
 function fillModelSuggestions(provider) {
   const dl = $("model-options")
@@ -1121,14 +1129,18 @@ function openSettings() {
       settingsOrigins = {
         "set-anthropic-key": c.anthropicKey ?? "",
         "set-openai-key": c.openaiKey ?? "",
+        "set-hsnr-key": c.hsnrKey ?? "",
       }
       $("set-provider").value = c.provider ?? ""
       $("set-anthropic-key").value = c.anthropicKey ?? ""
       $("set-openai-key").value = c.openaiKey ?? ""
       $("set-openai-base").value = c.openaiBaseUrl ?? ""
+      $("set-hsnr-key").value = c.hsnrKey ?? ""
+      $("set-hsnr-base").value = c.hsnrBaseUrl ?? ""
       $("set-model").value = c.model ?? ""
       $("set-thinking").value = c.thinking ?? "off"
       fillModelSuggestions(c.provider)
+      updateHsnrFields()
       $("set-config-path").textContent = c.configPath ?? "~/.anvil.json"
       $("settings").hidden = false
       $("settings-backdrop").hidden = false
@@ -1144,6 +1156,7 @@ function closeSettings() {
 async function saveSettings() {
   const ak = $("set-anthropic-key").value
   const ok = $("set-openai-key").value
+  const hk = $("set-hsnr-key").value
   const patch = {
     provider: $("set-provider").value,
     model: $("set-model").value.trim(),
@@ -1152,6 +1165,8 @@ async function saveSettings() {
   }
   if (ak !== settingsOrigins["set-anthropic-key"]) patch.anthropicKey = ak
   if (ok !== settingsOrigins["set-openai-key"]) patch.openaiKey = ok
+  if (hk !== settingsOrigins["set-hsnr-key"]) patch.hsnrKey = hk
+  patch.hsnrBaseUrl = $("set-hsnr-base").value.trim()
 
   const res = await fetch("/api/config", {
     method: "PUT",

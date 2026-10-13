@@ -25,7 +25,7 @@ import {
 import type { ProviderKind } from "./providers/index.ts"
 import type { Message, Provider, ThinkingEffort, ToolContext, Tool, ToolInput } from "./types.ts"
 
-export const VERSION = "0.5.0"
+export const VERSION = "0.5.1"
 export const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
 export const THINKING: ThinkingEffort[] = THINKING_LEVELS
 
@@ -45,9 +45,12 @@ interface ConfigView {
   thinking: ThinkingEffort
   hasAnthropicKey: boolean
   hasOpenaiKey: boolean
+  hasHsnrKey: boolean
   anthropicKey: string | null
   openaiKey: string | null
+  hsnrKey: string | null
   openaiBaseUrl: string | null
+  hsnrBaseUrl: string | null
   configPath: string
 }
 
@@ -362,18 +365,23 @@ export class AnvilServer {
     const file = loadConfig()
     const anthropicKey = process.env.ANTHROPIC_API_KEY || file.anthropicKey
     const openaiKey = process.env.OPENAI_API_KEY || file.openaiKey
+    const hsnrKey = process.env.OWUI_API_KEY || file.hsnrKey
     const s = this.settings
     return {
       provider:
         s?.kind ??
-        (file.provider || (anthropicKey ? "anthropic" : openaiKey ? "openai" : this.config.kind)),
+        (file.provider ||
+          (anthropicKey ? "anthropic" : openaiKey ? "openai" : hsnrKey ? "hsnr" : this.config.kind)),
       model: s?.model ?? (file.model || this.config.model),
       thinking: s?.thinking ?? (file.thinking ?? this.config.thinking),
       hasAnthropicKey: Boolean(anthropicKey),
       hasOpenaiKey: Boolean(openaiKey),
+      hasHsnrKey: Boolean(hsnrKey),
       anthropicKey: maskKey(anthropicKey),
       openaiKey: maskKey(openaiKey),
+      hsnrKey: maskKey(hsnrKey),
       openaiBaseUrl: process.env.OPENAI_BASE_URL || file.openaiBaseUrl || null,
+      hsnrBaseUrl: process.env.HSNR_BASE_URL || file.hsnrBaseUrl || null,
       configPath: configPath(),
     }
   }
@@ -424,8 +432,8 @@ export class AnvilServer {
         const patch: Partial<FileConfig> = {}
         const provider = str("provider")
         if (provider !== undefined) {
-          if (provider !== "" && provider !== "anthropic" && provider !== "openai") {
-            return json(res, 400, { error: "provider must be one of: anthropic | openai (or empty to auto-detect)" })
+          if (provider !== "" && provider !== "anthropic" && provider !== "openai" && provider !== "hsnr") {
+            return json(res, 400, { error: "provider must be one of: anthropic | openai | hsnr (or empty to auto-detect)" })
           }
           patch.provider = (provider || undefined) as ProviderKind
         }
@@ -444,6 +452,10 @@ export class AnvilServer {
         if (openaiKey !== undefined) patch.openaiKey = openaiKey
         const baseUrl = str("openaiBaseUrl")
         if (baseUrl !== undefined) patch.openaiBaseUrl = baseUrl
+        const hsnrKey = str("hsnrKey")
+        if (hsnrKey !== undefined) patch.hsnrKey = hsnrKey
+        const hsnrBase = str("hsnrBaseUrl")
+        if (hsnrBase !== undefined) patch.hsnrBaseUrl = hsnrBase
 
         saveConfig(patch)
         // Re-resolve the provider. When no API key is resolvable at all
