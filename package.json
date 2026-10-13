@@ -1,0 +1,17 @@
+{
+  "name": "anvil",
+  "version": "0.1.0",
+  "description": "An open-source coding agent that lives in your terminal",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "anvil": "./src/index.ts"
+  },
+  "engines": {
+    "node": ">=23.6.0"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "test": "node test/smoke.ts"
+  }
+}
