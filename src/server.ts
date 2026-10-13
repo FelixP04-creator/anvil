@@ -14,7 +14,7 @@ import { loadMemory } from "./memory.ts"
 import { createMainTools, createSubagentTools } from "./tools/index.ts"
 import type { Message, Provider, ToolContext, Tool, ToolInput } from "./types.ts"
 
-export const VERSION = "0.4.0"
+export const VERSION = "0.4.2"
 export const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
 
 export interface ServerConfig {
