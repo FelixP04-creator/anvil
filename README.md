@@ -48,12 +48,33 @@ done — with a permission system that keeps you in control.
 - **Memory** — project instructions from `ANVIL.md` in the working directory
   and user instructions from `~/.anvil/ANVIL.md` are loaded into the system
   prompt.
+- **Live streaming markdown** — answers are rendered as markdown *while* they
+  stream (headings, lists, tables, syntax-highlighted code), not as one
+  squashed block after completion; even an unclosed code fence renders live.
+- **Live file-change diffs** — every `Write`/`Edit` the agent makes (main
+  session or subagent) is diffed against the previous file content and shown
+  as a collapsible card with old/new line numbers and `+N/−M` stats.
+- **Image input** — attach up to 8 images per message (paste, drag & drop, or
+  file picker) in the web UI; they reach the model as native image blocks
+  (Anthropic base64 source / OpenAI `data:` URL) and appear in the transcript.
 - **Web UI** — `anvil server` starts a dependency-free REST + SSE server with
   a modern web interface: streamed markdown answers with syntax-highlighted
-  code blocks, a session sidebar with auto-titles and status dots, a live
-  todo panel, collapsible tool-call chips, in-browser permission prompts,
-  a settings dialog for provider/keys/model/thinking, light/dark themes, and
-  a red stop button that aborts a running turn.
+  code blocks, a session sidebar with auto-titles, status dots, and a search
+  box, a live todo panel, collapsible tool-call chips, in-browser permission
+  prompts, a settings dialog for provider/keys/model/thinking, light/dark
+  themes, a red stop button that aborts a running turn, slash commands with
+  autocomplete (`/help /new /fork /model /thinking /mode /export /notify`),
+  browser notifications for permission prompts and finished turns (when the
+  tab is hidden), and one-click export of the conversation as Markdown or a
+  self-contained HTML file. The layout is touch-friendly on phones.
+- **Sessions that survive** — web sessions and CLI conversations are stored
+  as JSON next to the config file. The web UI reloads them after a server
+  restart; the CLI resumes them with `anvil -c` (most recent) or
+  `anvil -r <id>` (by id or prefix), and `anvil sessions` lists them with
+  model, turn count, and age.
+- **Session forking** — branch any session at any assistant message (the web
+  UI shows a fork button per answer; the API is
+  `POST /api/sessions/:id/fork`), then continue both branches independently.
 - **Multi-turn sessions** — the CLI REPL and web sessions keep the full
   conversation history across turns.
 
@@ -71,6 +92,9 @@ anvil config set model claude-sonnet-4-5       # optional: pick model + thinking
 anvil config set thinking medium
 anvil "fix the failing test in test/auth.test.ts"
 anvil                                  # interactive session
+anvil -c                               # resume the most recent session
+anvil -r 3f2ab9c1                      # resume a specific session (prefix ok)
+anvil sessions                         # list stored sessions
 ```
 
 API keys can also come from environment variables (`ANTHROPIC_API_KEY`,
@@ -105,9 +129,34 @@ The permission mode can be switched live in the header.
 
 - **Sessions** — the sidebar lists every session with an auto title (first
   message), turn count, and a status dot (pulsing while working, amber while
-  waiting for a permission). Sessions survive page reloads: the `?session=<id>`
-  deep link reopens them, and the transcript is replayed from the server,
-  including a permission prompt that is still pending.
+  waiting for a permission). A search box filters the list (fuzzy: substring
+  or subsequence over title and model). Sessions survive page reloads *and
+  server restarts*: the `?session=<id>` deep link reopens them, and the
+  transcript is replayed from the server, including a permission prompt that
+  is still pending.
+- **Forking** — every assistant answer carries a small fork button (hover the
+  message). Clicking it — or typing `/fork` — branches the conversation at
+  that point into a new, independently resumable session. The new session
+  starts with a `Forked from …` note in its header.
+- **File changes** — each `Write`/`Edit` renders as a collapsible card with
+  the file path, a `+N/−M` stat, and a two-gutter diff (old/new line numbers,
+  green/red rows, collapsed context runs). Changes made by a subagent are
+  tagged. A per-turn summary chip below the answer lists the files touched
+  and the input/output tokens of the turn.
+- **Images** — the paperclip button (or pasting / dragging files) attaches up
+  to 8 images (≤ 10 MB each) with previews; they send with the next message
+  and show as thumbnails in your message bubble.
+- **Export** — the export button downloads the conversation as Markdown or as
+  a self-contained HTML file (the same renderer, inline CSS, no external
+  assets).
+- **Notifications** — toggle with the bell (or `/notify on|off`). While the
+  tab is hidden, anvil raises a browser notification for permission prompts
+  and when a turn finishes; the page title also flips to "⏳ anvil —
+  working" while busy.
+- **Slash commands** — typing `/` in the composer opens an autocomplete
+  popup: `/help`, `/new`, `/fork`, `/model [name]`, `/thinking <level>`,
+  `/mode <mode>`, `/export [md|html]`, `/notify [on|off]`. Navigate with
+  ↑/↓, pick with Tab/Enter, dismiss with Esc.
 - **Stop** — while a turn is running the send button turns red; clicking it
   (or pressing `Esc`) aborts the turn: the in-flight model call is cancelled
   and a pending permission prompt is resolved as denied.
@@ -142,19 +191,23 @@ node scripts/demo-server.ts        # prints a ready-made session URL
 | `GET` | `/api/config` | current settings; API keys masked, never raw |
 | `PUT` | `/api/config` | update `provider`, `model`, `thinking`, `anthropicKey`, `openaiKey`, `openaiBaseUrl` (empty string clears a field); persisted to `~/.anvil.json` |
 | `POST` | `/api/sessions` | create a session (`{ "mode", "model", "thinking" }`, all optional) |
-| `GET` | `/api/sessions` | list sessions (auto title, mode, busy, turns, permission-pending) |
-| `GET` | `/api/sessions/:id` | state: title, model, thinking, mode, busy, todos, usage, turns, pending permission |
-| `DELETE` | `/api/sessions/:id` | delete a session (aborts a running turn first) |
-| `GET` | `/api/sessions/:id/transcript` | renderable replay of everything that happened (incl. thinking) |
-| `POST` | `/api/sessions/:id/messages` | `{ "text": "…" }` → starts a turn (202) |
+| `GET` | `/api/sessions` | list sessions, merged from memory + disk (auto title, mode, busy, turns, usage, permission-pending) |
+| `GET` | `/api/sessions/:id` | state: title, model, thinking, mode, busy, todos, usage, turns, `msgCount`, `forkedFrom`, last-turn changes, pending permission |
+| `DELETE` | `/api/sessions/:id` | delete a session and its stored file (aborts a running turn first) |
+| `POST` | `/api/sessions/:id/fork` | branch the session at a message (`{ "msgIndex" }`, optional; clamped off tool-call boundaries) → `201` with the new session (400 if empty, 409 if busy) |
+| `GET` | `/api/sessions/:id/transcript` | renderable replay of everything that happened (incl. thinking, images, `msgIndex` fork points) |
+| `POST` | `/api/sessions/:id/messages` | `{ "text": "…", "images": [{ "mediaType", "data" }] }` → starts a turn (202; ≤ 15 MB body, ≤ 8 images) |
 | `POST` | `/api/sessions/:id/abort` | stop the running turn (`{ "stopped": true }`) |
 | `GET` | `/api/sessions/:id/events` | SSE stream of agent events |
 | `POST` | `/api/sessions/:id/permissions` | `{ "id": "perm-1", "answer": "once" }` |
 | `POST` | `/api/sessions/:id/mode` | `{ "mode": "plan" }` |
 
-SSE events: `session`, `assistant_delta`, `assistant_text`, `thinking_delta`,
-`tool_start`, `tool_end`, `permission_request`, `permission_resolved`,
-`denied`, `retry`, `error`, `aborted`, `todos`, `turn_end`, `mode_changed`.
+SSE events: `session`, `assistant_delta`, `assistant_text` (carries a
+`msgIndex` fork point), `thinking_delta`, `tool_start`, `tool_end`,
+`file_change` (path, kind, `+N/−M`, line diff), `permission_request`,
+`permission_resolved`, `denied`, `retry`, `error`, `aborted`, `todos`,
+`turn_end` (per-turn usage + the turn's file changes + `msgCount`),
+`mode_changed`.
 
 ## Configuration
 
@@ -210,19 +263,21 @@ elsewhere the setting is ignored, not an error.
 
 ```
 src/
-├── index.ts            CLI: arg parsing, one-shot / interactive / server / config
-├── repl.ts             interactive loop: streamed output, permission prompts
-├── server.ts           REST + SSE server, sessions, settings API, static web UI
+├── index.ts            CLI: arg parsing, one-shot / interactive / server / config / sessions
+├── repl.ts             interactive loop: streamed output, permission prompts, persistence
+├── server.ts           REST + SSE server, sessions, forking, diffs, settings API, static web UI
 ├── agent.ts            the agent loop (model ⇄ tools), retry + continuation
 ├── permissions.ts      permission modes + ask/always/deny rules
 ├── prompt.ts           original system prompts + environment detection
 ├── config.ts           settings: ~/.anvil.json, key/model/thinking resolution
+├── store.ts            session persistence (one JSON per session, $ANVIL_CONFIG aware)
+├── diff.ts             dependency-free line diff (prefix/suffix strip + bounded LCS)
 ├── memory.ts           ANVIL.md loading (project + user)
-├── types.ts            shared types (Tool, Provider, messages, thinking)
+├── types.ts            shared types (Tool, Provider, messages, thinking, images)
 ├── providers/
 │   ├── index.ts        provider kinds + defaults
 │   ├── anthropic.ts    Messages API, SSE streaming, extended thinking, no SDK
-│   └── openai.ts       chat completions, SSE streaming, reasoning_effort
+│   └── openai.ts       chat completions, SSE streaming, reasoning_effort, image parts
 └── tools/
     ├── read.ts  write.ts  edit.ts  bash.ts  glob.ts  grep.ts
     ├── todo.ts         todo list (exactly one in_progress at a time)
@@ -231,12 +286,15 @@ src/
 bin/
 └── anvil.js            npm launcher shim (npm rejects .ts bin entries)
 web/
-├── index.html  styles.css  app.js   dependency-free UI (vanilla JS)
+├── index.html  styles.css   dependency-free UI shell
+├── app.js                ES module: live streaming markdown, file cards, images,
+│                         forking, slash commands, export, notifications, search
+└── md.js                 isomorphic markdown + syntax highlight (browser + tests)
 scripts/
 └── demo-server.ts              web UI demo, no API key needed
 test/
-├── smoke.ts            agent loop, tools, permissions (mock provider)
-└── server-smoke.ts     HTTP server: sessions, SSE, permission flow, settings
+├── smoke.ts            agent loop, tools, permissions, diff, store, markdown (mock)
+└── server-smoke.ts     HTTP server: sessions, SSE, diffs, fork, images, persistence
 ```
 
 **Agent loop** (`agent.ts`): the conversation history is a plain array of
@@ -267,6 +325,25 @@ context, and permission engine. Permission prompts suspend the turn as a
 pending promise and are broadcast over SSE; the UI answers them through the
 API. The SSE subscription is registered before the response starts, so no
 event can be lost.
+
+**Persistence** (`store.ts`): sessions are written as one JSON file each in
+`~/.anvil/anvil-sessions/` (next to the config; `$ANVIL_CONFIG` redirects the
+whole tree, which keeps tests hermetic). The server saves after create/turn/
+mode/fork, merges in-memory sessions with the disk on `GET /api/sessions`
+(2 s cache), and lazily adopts a stored session when it is addressed by id —
+so a restart transparently reopens old conversations. The CLI persists the
+same way after every turn.
+
+**Forking**: `POST /api/sessions/:id/fork` deep-copies the history up to a
+message index (clamped back past any `tool_use` message, so a fork never
+straddles a dangling tool call) and records `forkedFrom { id, at }`.
+
+**Live diffs** (`diff.ts` + `wrapFileDiff`): `Write` and `Edit` (main session
+and subagents) are wrapped to snapshot the file before/after and broadcast a
+`file_change` event with a line diff. The diff strips common prefix/suffix
+line runs in O(n) and aligns the changed middle with an LCS DP that is capped
+at 100 000 cells; the emitted diff is capped at 600 rows (250 head + gap +
+250 tail) while the `+N/−M` stats always reflect the whole change.
 
 ## Design notes
 

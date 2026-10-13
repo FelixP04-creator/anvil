@@ -10,6 +10,12 @@ export interface ReplDeps {
   makeOptions: (engine: PermissionEngine) => AgentOptions
   ctx: ToolContext
   mode: PermissionMode
+  /** Preloaded history (resume). */
+  history?: Message[]
+  /** Stable session id, printed so the user can resume later. */
+  sessionId?: string
+  /** Called after each finished turn (session persistence hook). */
+  onTurn?: (history: Message[], usage: { input: number; output: number }) => void
 }
 
 const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
@@ -26,9 +32,15 @@ export async function startRepl(deps: ReplDeps): Promise<void> {
   const engine = new PermissionEngine(deps.mode, ask, true)
 
   // Conversation history persists across turns so the agent remembers context.
-  const history: Message[] = []
+  const history: Message[] = [...(deps.history ?? [])]
 
   console.log("anvil — interactive mode. /help for commands, Ctrl+D or /exit to quit.")
+  if (deps.sessionId) {
+    console.log(`session: ${deps.sessionId} — resume later with: anvil -r ${deps.sessionId}`)
+  }
+  if (history.length > 0) {
+    console.log(`resumed ${history.length} saved messages`)
+  }
 
   while (true) {
     let line: string
@@ -108,7 +120,12 @@ export async function startRepl(deps: ReplDeps): Promise<void> {
     }
 
     try {
-      await runAgent({ ...base, onEvent }, history)
+      const result = await runAgent({ ...base, onEvent }, history)
+      try {
+        deps.onTurn?.(history, result.usage)
+      } catch {
+        // persistence is best-effort
+      }
     } catch (err) {
       console.error(`error: ${String(err)}`)
     }

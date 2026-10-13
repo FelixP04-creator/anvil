@@ -40,6 +40,9 @@ export type ContentBlock =
   | { type: "thinking"; text: string; signature?: string }
   | { type: "tool_use"; id: string; name: string; input: ToolInput }
   | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }
+  /** User-attached image. `data` is raw base64 (no data: prefix);
+   *  providers convert it to their wire format (image_url / source). */
+  | { type: "image"; mediaType: string; data: string }
 
 export interface Message {
   role: "user" | "assistant"

@@ -1,10 +1,11 @@
 // anvil web UI — vanilla JS, zero dependencies.
 //
-// Performance model (learned from watching other agent UIs melt on long
-// sessions): streaming deltas are appended to ONE text node, batched per
-// animation frame. Markdown parsing and syntax highlighting run exactly
-// once, when a message completes. The DOM only ever grows — nothing is
-// re-rendered per token.
+// Streaming model: deltas land in a buffer and the message is re-rendered as
+// markdown ~10 times a second (rAF-throttled) — so answers read as formatted
+// markdown from the very first token instead of a squashed raw-text block
+// that only gets formatted when the message completes.
+
+import { escapeHtml, renderMarkdown } from "./md.js"
 
 const $ = (id) => document.getElementById(id)
 
@@ -16,8 +17,12 @@ let busy = false
 let sseWasDown = false
 
 let streamEl = null // .msg-text element currently receiving deltas
-let streamNode = null // the single text node inside it
+let streamWrap = null // its .msg.assistant wrapper (for the fork button)
 let streamBuf = ""
+let streamDirty = false
+let lastStreamHtml = ""
+let lastStreamRenderAt = 0
+let lastStreamLen = 0
 let raf = 0
 let pinned = true // auto-scroll only while the user is near the bottom
 
@@ -30,7 +35,10 @@ const openTools = new Map() // toolName -> queue of in-flight chip elements
 const renderedPerms = new Set() // permission ids already on screen
 const permCards = new Map() // permId -> { card, decided }
 
-let cbCounter = 0
+let pendingImages = [] // { file, url } attached to the next message
+let lastMsgCount = 0 // history length (fork point for /fork)
+let allSessions = [] // last session listing (for the search filter)
+let slashIdx = 0
 
 // ---------------------------------------------------------------- helpers
 
@@ -39,10 +47,6 @@ function el(tag, cls, text) {
   if (cls) n.className = cls
   if (text !== undefined) n.textContent = text
   return n
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
 }
 
 function fmtTokens(n) {
@@ -82,163 +86,7 @@ const ICONS = {
   shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.8l7.5 2.8v5.6c0 4.8-3.2 8.6-7.5 10-4.3-1.4-7.5-5.2-7.5-10V5.6z"/><path d="M9.2 12l2 2 3.6-4"/></svg>',
   mark: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.8 4.4c.3-.3.8-.4 1.2-.4h12.3c1.6 0 3.1.5 4.3 1.4.5.3.6 1 .2 1.5l-.8 1c-1 1.2-2.4 2-4 2.4v2.1c0 .7-.5 1.2-1.2 1.2h-1.3v2.6c1.7.4 3 1.5 3.6 3.2.2.6-.2 1.2-.9 1.2H5.6c-.7 0-1.1-.6-.9-1.2.6-1.7 1.9-2.8 3.6-3.2v-2.6H7c-.7 0-1.2-.5-1.2-1.2v-2.1c-1.7-.5-3.2-1.6-4.3-3.1-.3-.5-.2-1.2.3-1.8z"/></svg>',
   think: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4l1.6 4.4L18 10l-4.4 1.6L12 16l-1.6-4.4L6 10l4.4-1.6z"/><path d="M18.8 14.5l.9 2.3 2.3.9-2.3.9-.9 2.3-.9-2.3-2.3-.9 2.3-.9z"/></svg>',
-}
-
-// ---------------------------------------------------------------- markdown
-
-// Tiny, safe markdown renderer: escape first, then transform. Supports
-// fenced code blocks, headings, lists, blockquotes, hr, links, bold,
-// italic and inline code — everything an agent answer actually uses.
-
-function inlineMd(s) {
-  return s
-    .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
-}
-
-function codeBlockHtml({ lang, code }) {
-  const id = `cb${++cbCounter}`
-  return `<div class="codeblock"><div class="cb-head"><span class="cb-lang">${escapeHtml(lang || "text")}</span><button class="cb-copy" type="button" data-cb="${id}">copy</button></div><pre class="cb-pre" id="${id}"><code>${highlight(code, lang)}</code></pre></div>`
-}
-
-function renderMarkdown(src) {
-  const blocks = []
-  const text = String(src).replace(/```([\w+#.-]*)[ \t]*\n?([\s\S]*?)(?:```|$)/g, (_m, lang, code) => {
-    blocks.push({ lang: lang || "", code: code.replace(/\n$/, "") })
-    return `\u0000CB${blocks.length - 1}\u0000`
-  })
-  const lines = escapeHtml(text).split("\n")
-  let html = ""
-  let para = []
-  let list = null
-  const flushPara = () => {
-    if (para.length) {
-      html += `<p>${inlineMd(para.join(" "))}</p>`
-      para = []
-    }
-  }
-  const flushList = () => {
-    if (list) {
-      html += `<${list.type}>${list.items.map((i) => `<li>${inlineMd(i)}</li>`).join("")}</${list.type}>`
-      list = null
-    }
-  }
-  for (const raw of lines) {
-    const line = raw.replace(/\s+$/, "")
-    if (!line.trim()) {
-      flushPara()
-      flushList()
-      continue
-    }
-    const cb = line.match(/^\u0000CB(\d+)\u0000$/)
-    if (cb) {
-      flushPara()
-      flushList()
-      html += codeBlockHtml(blocks[+cb[1]])
-      continue
-    }
-    const h = line.match(/^(#{1,4})\s+(.*)$/)
-    if (h) {
-      flushPara()
-      flushList()
-      const lvl = h[1].length + 1 // h1 is the page title; demote
-      html += `<h${lvl}>${inlineMd(h[2])}</h${lvl}>`
-      continue
-    }
-    if (/^(-{3,}|\*{3,})$/.test(line.trim())) {
-      flushPara()
-      flushList()
-      html += "<hr>"
-      continue
-    }
-    const ul = line.match(/^\s*[-*+]\s+(.*)$/)
-    if (ul) {
-      flushPara()
-      if (!list || list.type !== "ul") {
-        flushList()
-        list = { type: "ul", items: [] }
-      }
-      list.items.push(ul[1])
-      continue
-    }
-    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/)
-    if (ol) {
-      flushPara()
-      if (!list || list.type !== "ol") {
-        flushList()
-        list = { type: "ol", items: [] }
-      }
-      list.items.push(ol[1])
-      continue
-    }
-    const bq = line.match(/^&gt;\s?(.*)$/)
-    if (bq) {
-      flushPara()
-      flushList()
-      html += `<blockquote>${inlineMd(bq[1])}</blockquote>`
-      continue
-    }
-    para.push(line)
-  }
-  flushPara()
-  flushList()
-  return html
-}
-
-// ---------------------------------------------------------------- highlighting
-
-const KEYWORDS = {
-  js: "const|let|var|function|return|if|else|for|while|do|import|from|export|default|new|class|extends|super|implements|interface|type|enum|await|async|try|catch|finally|throw|switch|case|break|continue|yield|of|in|instanceof|typeof|void|delete|this|static|get|set|null|undefined|true|false",
-  bash: "echo|cd|ls|cat|node|npm|npx|pnpm|yarn|bun|deno|git|curl|wget|mkdir|rm|cp|mv|touch|find|grep|sed|awk|sort|head|tail|wc|diff|patch|chmod|chown|sudo|docker|make|test|python|python3|pip|uv|export|source|alias|unset|which|pwd|exit|return|set|local",
-  py: "def|class|return|if|elif|else|for|while|import|from|as|with|try|except|finally|raise|pass|break|continue|lambda|yield|global|nonlocal|None|True|False|print|in|not|and|or|is",
-  json: "true|false|null",
-  css: "@media|@keyframes|@import|@font-face|@supports|@layer",
-}
-
-function buildRules(lang) {
-  const L = String(lang || "").toLowerCase()
-  const kw =
-    L === "json" ? KEYWORDS.json
-    : L.startsWith("sh") || L === "bash" || L === "shell" ? KEYWORDS.bash
-    : L.startsWith("py") ? KEYWORDS.py
-    : L === "css" || L === "scss" || L === "less" ? KEYWORDS.css
-    : KEYWORDS.js
-  const str = String.raw`'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|\`(?:[^\`\\]|\\.)*\``
-  const rules = [
-    { cls: "tk-c", src: L.startsWith("sh") || L === "bash" || L === "shell" ? String.raw`#[^\n]*` : String.raw`//[^\n]*|/\*[\s\S]*?\*/` },
-    { cls: "tk-s", src: str },
-    { cls: "tk-n", src: L === "css" ? String.raw`\b\d[\d.]*(?:px|rem|em|vh|vw|vmin|vmax|s|ms|deg|fr|ch|%)?\b` : String.raw`\b\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?\b` },
-    { cls: "tk-k", src: `(?:\\b(?:${kw})\\b)` },
-  ]
-  if (!L.startsWith("sh") && L !== "bash" && L !== "shell") {
-    rules.push({ cls: "tk-f", src: String.raw`\b[A-Za-z_$][\w$]*(?=\s*\()` })
-  }
-  return rules
-}
-
-function highlight(code, lang) {
-  const rules = buildRules(lang)
-  const re = new RegExp(rules.map((r) => `(${r.src})`).join("|"), "g")
-  let out = ""
-  let last = 0
-  let m
-  while ((m = re.exec(code)) !== null) {
-    out += escapeHtml(code.slice(last, m.index))
-    let cls = "tk-k"
-    for (let i = 1; i < m.length; i++) {
-      if (m[i] !== undefined) {
-        cls = rules[i - 1].cls
-        break
-      }
-    }
-    out += `<span class="${cls}">${escapeHtml(m[0])}</span>`
-    last = m.index + m[0].length
-    if (m[0].length === 0) re.lastIndex++
-  }
-  out += escapeHtml(code.slice(last))
-  return out
+  fork: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5.5" r="2.3"/><circle cx="6" cy="18.5" r="2.3"/><circle cx="18" cy="12" r="2.3"/><path d="M6 7.8v8.4M8 6.6c4.5 1 6.7 2.7 7.7 4.6"/></svg>',
 }
 
 // ---------------------------------------------------------------- messages
@@ -270,24 +118,54 @@ function append(node) {
   return node
 }
 
-function userMsg(text) {
-  return append(el("div", "msg user", text))
+function userMsg(text, images) {
+  const wrap = el("div", "msg user")
+  if (text) wrap.appendChild(el("div", "user-text", text))
+  if (images && images.length) {
+    const grid = el("div", "user-imgs")
+    for (const img of images.slice(0, 6)) {
+      const i = document.createElement("img")
+      i.src = img.url
+      i.alt = img.name || "image"
+      i.title = img.name || ""
+      grid.appendChild(i)
+    }
+    if (images.length > 6) grid.appendChild(el("span", "user-imgs-more", `+${images.length - 6}`))
+    wrap.appendChild(grid)
+  }
+  return append(wrap)
 }
 
 function assistantMsg() {
   const wrap = el("div", "msg assistant")
   const role = el("div", "msg-role")
   role.innerHTML = ICONS.mark
-  const roleName = el("span", null, "anvil")
-  role.appendChild(roleName)
+  role.appendChild(el("span", null, "anvil"))
+  const forkBtn = el("button", "fork-btn", null)
+  forkBtn.type = "button"
+  forkBtn.title = "Fork the session from this message"
+  forkBtn.innerHTML = ICONS.fork
+  forkBtn.addEventListener("click", () => {
+    const idx = wrap.dataset.msgIndex
+    if (idx === undefined || idx === "") {
+      toast("No fork point for this message yet", "info")
+      return
+    }
+    forkFrom(+idx)
+  })
+  role.appendChild(forkBtn)
   const text = el("div", "msg-text")
   wrap.append(role, text)
   append(wrap)
-  return text
+  return { wrap, text }
 }
 
 function errorLine(text) {
   append(el("div", "error-line", String(text)))
+}
+
+function systemLine(text) {
+  append(el("div", "system-line", text))
 }
 
 function formatInput(name, input) {
@@ -410,6 +288,77 @@ function onToolEnd(ev) {
   }
 }
 
+// ---------------------------------------------------------------- file changes
+
+function diffRowHtml(ln) {
+  const cls = ln.t === "add" ? "dl-add" : ln.t === "del" ? "dl-del" : "dl-ctx"
+  const sign = ln.t === "add" ? "+" : ln.t === "del" ? "−" : " "
+  return `<div class="dl ${cls}"><span class="dl-no">${ln.no ?? ""}</span><span class="dl-nn">${ln.nn ?? ""}</span><span class="dl-sign">${sign}</span><span class="dl-text">${escapeHtml(ln.text) || " "}</span></div>`
+}
+
+/** Long context runs collapse to 2 + 2 lines around a "… n lines" gap. */
+function diffHtml(lines) {
+  const MAX_CTX = 6
+  let html = ""
+  let i = 0
+  while (i < lines.length) {
+    const ln = lines[i]
+    if (ln.gap) {
+      html += `<div class="dl-gap">⋯ ${ln.gap} lines</div>`
+      i++
+      continue
+    }
+    if (ln.t === "ctx") {
+      let j = i
+      while (j < lines.length && lines[j].t === "ctx" && !lines[j].gap) j++
+      const run = j - i
+      if (run <= MAX_CTX) {
+        for (let k = i; k < j; k++) html += diffRowHtml(lines[k])
+      } else {
+        for (let k = i; k < i + 2; k++) html += diffRowHtml(lines[k])
+        html += `<div class="dl-gap">⋯ ${run - 4} lines</div>`
+        for (let k = j - 2; k < j; k++) html += diffRowHtml(lines[k])
+      }
+      i = j
+    } else {
+      html += diffRowHtml(ln)
+      i++
+    }
+  }
+  return html
+}
+
+function buildFileCard(c) {
+  const card = el("div", "filecard")
+  const head = el("div", "filecard-head")
+  const ic = el("span", "filecard-ic")
+  ic.innerHTML = ICONS[c.kind === "edit" ? "Edit" : "Write"] ?? ICONS.tool
+  const pathEl = el("span", "filecard-path", c.path)
+  pathEl.title = c.path
+  const stats = el("span", "filecard-stats")
+  stats.appendChild(el("span", "fc-add", `+${c.additions ?? 0}`))
+  stats.appendChild(el("span", "fc-del", `−${c.deletions ?? 0}`))
+  if (c.subagent) stats.appendChild(el("span", "fc-sub", "subagent"))
+  head.append(ic, pathEl, stats)
+  head.insertAdjacentHTML("beforeend", ICONS.caret)
+  const lines = c.diff ?? []
+  const body = el("div", "filecard-body")
+  if (lines.length) {
+    body.innerHTML = `<div class="diff">${diffHtml(lines)}</div>`
+  } else {
+    body.appendChild(el("div", "diff-note", "no diff details stored"))
+  }
+  card.append(head, body)
+  head.addEventListener("click", () => card.classList.toggle("open"))
+  if (lines.length <= 40) card.classList.add("open")
+  return card
+}
+
+function renderChanges(changes) {
+  if (!changes || !changes.length) return
+  for (const c of changes) append(buildFileCard(c))
+}
+
 // ---------------------------------------------------------------- permissions
 
 const PERM_LABEL = { once: "Allowed once", always: "Always allowed", deny: "Denied", stopped: "Stopped" }
@@ -450,6 +399,7 @@ function onPermission(ev) {
   card.append(actions, decided)
   append(card)
   permCards.set(ev.id, { card, decided })
+  maybeNotify("anvil needs permission", ev.detail || ev.toolName)
 }
 
 async function answerPerm(id, answer, card, decided) {
@@ -475,13 +425,21 @@ function resolvePermCard(id, answer) {
 }
 
 // ---------------------------------------------------------------- streaming
+//
+// Live markdown: each flush re-renders the buffer through renderMarkdown.
+// The rAF loop only keeps ticking while there are unflushed deltas.
 
 function beginStream() {
-  streamEl = assistantMsg()
+  const m = assistantMsg()
+  streamWrap = m.wrap
+  streamEl = m.text
   streamEl.classList.add("streaming")
-  streamNode = document.createTextNode("")
-  streamEl.appendChild(streamNode)
   streamBuf = ""
+  streamDirty = true
+  lastStreamHtml = ""
+  lastStreamRenderAt = 0
+  lastStreamLen = 0
+  scheduleStream()
 }
 
 /** Collapsible thinking block; open while streaming, collapsed after. */
@@ -522,14 +480,19 @@ function renderThinking(text) {
 function onDelta(text) {
   if (!streamEl) beginStream()
   streamBuf += text
+  streamDirty = true
   setStatus("working", "responding…")
-  if (!raf) raf = requestAnimationFrame(flushStream)
+  scheduleStream()
 }
 
 function onThinkingDelta(text) {
   if (!thinkEl) beginThinking()
   thinkBuf += text
   setStatus("working", "thinking…")
+  scheduleStream()
+}
+
+function scheduleStream() {
   if (!raf) raf = requestAnimationFrame(flushStream)
 }
 
@@ -540,9 +503,23 @@ function flushStream() {
     thinkNode.data = thinkBuf
     changed = true
   }
-  if (streamNode && streamBuf !== streamNode.data) {
-    streamNode.data = streamBuf
-    changed = true
+  if (streamEl && streamDirty) {
+    const now = Date.now()
+    // ~10 renders/second while streaming (or sooner for a big chunk) —
+    // enough to read as live markdown without re-parsing per token.
+    if (now - lastStreamRenderAt >= 100 || streamBuf.length - lastStreamLen >= 1200) {
+      lastStreamRenderAt = now
+      lastStreamLen = streamBuf.length
+      streamDirty = false
+      const html = renderMarkdown(streamBuf)
+      if (html !== lastStreamHtml) {
+        lastStreamHtml = html
+        streamEl.innerHTML = html
+        changed = true
+      }
+    } else {
+      scheduleStream()
+    }
   }
   if (changed && pinned) scrollBottom()
 }
@@ -568,15 +545,18 @@ function endStream(finalText) {
     if (body) body.textContent = thinkBuf
     finalizeThinking()
   }
-  if (!streamEl) return
+  if (!streamEl) return null
   const final = finalText !== undefined && finalText !== null ? finalText : streamBuf
   streamEl.classList.remove("streaming")
   streamEl.innerHTML = renderMarkdown(final)
+  const wrap = streamWrap
   streamEl = null
-  streamNode = null
+  streamWrap = null
   streamBuf = ""
+  streamDirty = false
   if (pinned) scrollBottom()
   updateJump()
+  return wrap
 }
 
 // ---------------------------------------------------------------- state
@@ -591,6 +571,7 @@ function setBusy(b) {
   busy = b
   $("send").classList.toggle("stop", b)
   $("send").title = b ? "Stop (Esc)" : "Send (Enter)"
+  document.title = b ? "⏳ anvil — working" : "anvil"
   if (b) setStatus("working", "anvil is working…")
   else setStatus("", "idle")
 }
@@ -604,13 +585,19 @@ function renderTodos(todos) {
   const panel = $("todo-panel")
   const list = $("todo-list")
   list.innerHTML = ""
+  const chip = $("todo-chip")
   if (!todos || todos.length === 0) {
     panel.dataset.empty = "true"
+    if (chip) chip.hidden = true
     return
   }
   panel.dataset.empty = "false"
   const done = todos.filter((t) => t.status === "completed").length
   $("todo-count").textContent = `${done}/${todos.length}`
+  if (chip) {
+    chip.hidden = false
+    $("todo-chip-count").textContent = `${done}/${todos.length}`
+  }
   for (const t of todos) {
     const li = el("li", t.status)
     li.append(el("span", "todo-ic"))
@@ -642,6 +629,7 @@ function applyState(s) {
   $("mode").value = s.mode ?? "default"
   renderTodos(s.todos)
   setTokens(s.usage)
+  if (s.msgCount !== undefined) lastMsgCount = s.msgCount
   if (s.busy) setBusy(true)
 }
 
@@ -659,14 +647,30 @@ async function refreshState() {
 
 // ---------------------------------------------------------------- session list
 
+function fuzzyMatch(q, text) {
+  const needle = q.toLowerCase()
+  const hay = (text || "").toLowerCase()
+  if (!needle) return true
+  if (hay.includes(needle)) return true
+  let i = 0
+  for (const ch of hay) {
+    if (ch === needle[i]) i++
+    if (i === needle.length) return true
+  }
+  return false
+}
+
 function renderList(list) {
+  allSessions = list
+  const q = $("sess-search").value.trim()
+  const shown = q ? list.filter((s) => fuzzyMatch(q, s.title) || fuzzyMatch(q, s.model)) : list
   const nav = $("session-list")
   nav.innerHTML = ""
-  if (!list.length) {
-    nav.appendChild(el("div", "sess-empty", "No sessions yet"))
+  if (!shown.length) {
+    nav.appendChild(el("div", "sess-empty", list.length ? "No matches" : "No sessions yet"))
     return
   }
-  for (const s of list) {
+  for (const s of shown) {
     const item = el("div", "sess")
     if (s.id === sessionId) item.classList.add("active")
     if (s.busy) item.classList.add("busy")
@@ -674,7 +678,8 @@ function renderList(list) {
 
     item.appendChild(el("span", "sess-dot"))
     item.appendChild(el("div", "sess-title", s.title))
-    item.appendChild(el("div", "sess-meta", `${s.turns} turn${s.turns === 1 ? "" : "s"} · ${timeAgo(s.createdAt)}`))
+    const meta = `${s.turns ?? 0} turn${(s.turns ?? 0) === 1 ? "" : "s"} · ${timeAgo(s.updatedAt ?? s.createdAt)}`
+    item.appendChild(el("div", "sess-meta", s.forkedFrom ? `fork · ${meta}` : meta))
 
     const del = el("button", "sess-del", "×")
     del.type = "button"
@@ -738,6 +743,7 @@ async function openSession(id) {
   $("mode").value = s.mode ?? "default"
   renderTodos(s.todos)
   setTokens(s.usage)
+  if (s.msgCount !== undefined) lastMsgCount = s.msgCount
 
   // Reset the conversation area.
   endStream(undefined)
@@ -751,13 +757,15 @@ async function openSession(id) {
   thinkNode = null
   thinkBuf = ""
 
-  // Replay the transcript, then any pending permission prompt, in that
-  // visual order — the SSE snapshot that follows is deduplicated.
+  // Replay the transcript, then the last turn's file changes, then any
+  // pending permission prompt, in that visual order — the SSE snapshot
+  // that follows is deduplicated.
   const t = await fetch(`/api/sessions/${id}/transcript`).catch(() => null)
   if (t && t.ok) {
     const data = await t.json()
     renderTranscript(data.entries ?? [])
   }
+  renderChanges(s.changes)
   if (s.pendingPermission) onPermission(s.pendingPermission)
 
   if (source) source.close()
@@ -770,11 +778,14 @@ async function openSession(id) {
 
 function renderTranscript(entries) {
   for (const e of entries) {
-    if (e.role === "user") userMsg(e.text)
-    else if (e.role === "thinking") renderThinking(e.text)
-    else if (e.role === "assistant") {
-      const t = assistantMsg()
-      t.innerHTML = renderMarkdown(e.text)
+    if (e.role === "user") {
+      userMsg(e.text, (e.images ?? []).map((im) => ({ url: `data:${im.mediaType};base64,${im.data}`, name: "" })))
+    } else if (e.role === "thinking") {
+      renderThinking(e.text)
+    } else if (e.role === "assistant") {
+      const { wrap, text } = assistantMsg()
+      text.innerHTML = renderMarkdown(e.text)
+      if (e.msgIndex !== undefined) wrap.dataset.msgIndex = e.msgIndex
     } else if (e.role === "tool") {
       if (e.pending) {
         append(buildTool(e.name, formatInput(e.name, e.args), "run", null))
@@ -796,6 +807,22 @@ async function newSession() {
   refreshList()
   await openSession(created.id)
   return created.id
+}
+
+async function forkFrom(idx) {
+  const res = await fetch(`/api/sessions/${sessionId}/fork`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ msgIndex: idx }),
+  }).catch(() => null)
+  if (!res || !res.ok) {
+    const err = res ? await res.json().catch(() => ({})) : {}
+    toast(err.error ?? "Could not fork the session", "err")
+    return
+  }
+  const f = await res.json()
+  toast("Forked — new session continues from that point", "ok")
+  await openSession(f.id)
 }
 
 // ---------------------------------------------------------------- SSE
@@ -844,6 +871,7 @@ async function rebuildTranscript() {
   if (sRes && sRes.ok) {
     const s = await sRes.json()
     applyState(s)
+    renderChanges(s.changes)
     if (s.pendingPermission) onPermission(s.pendingPermission)
     setBusy(s.busy)
   }
@@ -860,9 +888,13 @@ function handle(ev) {
     case "assistant_delta":
       onDelta(ev.text ?? "")
       break
-    case "assistant_text":
-      endStream(ev.text)
+    case "assistant_text": {
+      const wrap = endStream(ev.text)
+      // The server tags the finished message with its history index —
+      // that is the fork point for this message.
+      if (wrap && ev.msgIndex !== undefined) wrap.dataset.msgIndex = ev.msgIndex
       break
+    }
     case "thinking_delta":
       onThinkingDelta(ev.text ?? "")
       break
@@ -875,6 +907,9 @@ function handle(ev) {
     case "tool_end":
       onToolEnd(ev)
       break
+    case "file_change":
+      append(buildFileCard(ev))
+      break
     case "permission_request":
       onPermission(ev)
       break
@@ -884,6 +919,7 @@ function handle(ev) {
     case "error":
       errorLine(ev.text ?? "unknown error")
       setStatus("error", "error")
+      maybeNotify("anvil error", ev.text ?? "unknown error")
       break
     case "aborted":
       setStatus("stopped", "stopped")
@@ -901,13 +937,199 @@ function handle(ev) {
         onPermission(ev.pendingPermission)
       }
       break
-    case "turn_end":
+    case "turn_end": {
       endStream(undefined)
+      if (ev.usage && (ev.usage.input || ev.usage.output)) {
+        append(el("div", "turn-usage", `↑ ${fmtTokens(ev.usage.input)} in · ↓ ${fmtTokens(ev.usage.output)} out this turn`))
+      }
+      if (ev.changes && ev.changes.length) {
+        const n = ev.changes.length
+        const add = ev.changes.reduce((x, c) => x + (c.additions ?? 0), 0)
+        const del = ev.changes.reduce((x, c) => x + (c.deletions ?? 0), 0)
+        append(el("div", "turn-changes", `${n} file${n === 1 ? "" : "s"} changed · +${add} −${del}`))
+      }
       setBusy(false)
       setStatus("", "idle")
+      lastMsgCount = ev.msgCount ?? lastMsgCount
+      maybeNotify("Turn finished", $("session-title").textContent || "anvil")
       refreshState()
       refreshList()
       break
+    }
+  }
+}
+
+// ---------------------------------------------------------------- images
+
+function addImageFiles(fileList) {
+  const files = [...(fileList ?? [])]
+  for (const f of files) {
+    if (!f) continue
+    if (!f.type || !f.type.startsWith("image/")) {
+      toast(`skipped "${f.name}": not an image`, "err")
+      continue
+    }
+    if (pendingImages.length >= 8) {
+      toast("Max 8 images per message", "err")
+      break
+    }
+    if (f.size > 10 * 1024 * 1024) {
+      toast(`"${f.name}" is too big (max 10 MB)`, "err")
+      continue
+    }
+    pendingImages.push({ file: f, url: URL.createObjectURL(f) })
+  }
+  renderImagePreviews()
+}
+
+function renderImagePreviews() {
+  const row = $("img-previews")
+  row.innerHTML = ""
+  row.hidden = pendingImages.length === 0
+  pendingImages.forEach((p, i) => {
+    const d = el("div", "img-prev")
+    const img = document.createElement("img")
+    img.src = p.url
+    img.alt = p.file.name
+    d.appendChild(img)
+    const x = el("button", "img-prev-x", "×")
+    x.type = "button"
+    x.title = "Remove image"
+    x.addEventListener("click", () => {
+      URL.revokeObjectURL(p.url)
+      pendingImages.splice(i, 1)
+      renderImagePreviews()
+    })
+    d.appendChild(x)
+    row.appendChild(d)
+  })
+}
+
+function clearImages() {
+  for (const p of pendingImages) URL.revokeObjectURL(p.url)
+  pendingImages = []
+  renderImagePreviews()
+}
+
+function readImages() {
+  return Promise.all(
+    pendingImages.map((p) =>
+      new Promise((resolve, reject) => {
+        const r = new FileReader()
+        r.onload = () => {
+          const s = String(r.result)
+          const i = s.indexOf("base64,")
+          resolve({ mediaType: s.slice(5, i), data: s.slice(i + 7) })
+        }
+        r.onerror = () => reject(r.error)
+        r.readAsDataURL(p.file)
+      }),
+    ),
+  )
+}
+
+// ---------------------------------------------------------------- slash commands
+
+const SLASH_COMMANDS = [
+  { cmd: "/help", usage: "/help", desc: "list all commands" },
+  { cmd: "/new", usage: "/new", desc: "start a new session" },
+  { cmd: "/fork", usage: "/fork", desc: "fork from the last message" },
+  { cmd: "/model", usage: "/model [name]", desc: "show or switch the model" },
+  { cmd: "/thinking", usage: "/thinking <off|low|medium|high>", desc: "set the thinking effort" },
+  { cmd: "/mode", usage: "/mode <default|acceptEdits|plan|bypass>", desc: "set the permission mode" },
+  { cmd: "/export", usage: "/export [md|html]", desc: "download the conversation" },
+  { cmd: "/notify", usage: "/notify [on|off]", desc: "browser notifications" },
+]
+
+function slashPop() {
+  return $("slash-pop")
+}
+
+function hideSlash() {
+  slashPop().hidden = true
+  slashIdx = 0
+}
+
+function updateSlash() {
+  const v = $("input").value
+  const pop = slashPop()
+  const m = v.match(/^\/([a-z]*)\s*$/)
+  if (!m) {
+    hideSlash()
+    return
+  }
+  const filtered = SLASH_COMMANDS.filter((c) => c.cmd.startsWith("/" + m[1]))
+  if (!filtered.length) {
+    hideSlash()
+    return
+  }
+  if (slashIdx >= filtered.length) slashIdx = 0
+  pop.innerHTML = ""
+  filtered.forEach((c, i) => {
+    const row = el("div", "slash-item" + (i === slashIdx ? " active" : ""))
+    row.append(el("span", "slash-cmd", c.usage), el("span", "slash-desc", c.desc))
+    row.addEventListener("mousedown", (e) => {
+      e.preventDefault()
+      pickSlash(c.cmd)
+    })
+    pop.appendChild(row)
+  })
+  pop.hidden = false
+}
+
+function pickSlash(cmd) {
+  const input = $("input")
+  input.value = cmd + " "
+  hideSlash()
+  grow()
+  input.focus()
+}
+
+function handleCommand(text) {
+  const parts = text.trim().split(/\s+/)
+  const name = parts[0].toLowerCase()
+  const arg = parts[1]
+  switch (name) {
+    case "/help":
+      systemLine(SLASH_COMMANDS.map((c) => `${c.usage.padEnd(34)}  ${c.desc}`).join("\n"))
+      break
+    case "/new":
+      newSession()
+      break
+    case "/fork": {
+      const idx = lastMsgCount - 1
+      if (idx < 0) systemLine("nothing to fork yet — send a message first")
+      else forkFrom(idx)
+      break
+    }
+    case "/model":
+      if (arg) setModel(arg)
+      else systemLine(`current model: ${$("model").value || "—"}`)
+      break
+    case "/thinking": {
+      if (!["off", "low", "medium", "high"].includes(arg)) {
+        systemLine("usage: /thinking <off|low|medium|high>")
+        break
+      }
+      applyThinking(arg)
+      break
+    }
+    case "/mode": {
+      if (!["default", "acceptEdits", "plan", "bypass"].includes(arg)) {
+        systemLine("usage: /mode <default|acceptEdits|plan|bypass>")
+        break
+      }
+      applyMode(arg)
+      break
+    }
+    case "/export":
+      doExport(arg === "html" ? "html" : "md")
+      break
+    case "/notify":
+      toggleNotify(arg === "off")
+      break
+    default:
+      systemLine(`unknown command: ${name} — try /help`)
   }
 }
 
@@ -919,24 +1141,54 @@ function grow() {
   input.style.height = `${Math.min(input.scrollHeight, 200)}px`
 }
 
+async function postMessage(body) {
+  return fetch(`/api/sessions/${sessionId}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch(() => null)
+}
+
 async function sendNow() {
   if (busy) return
   const input = $("input")
   const text = input.value.trim()
-  if (!text) return
+  const hasImages = pendingImages.length > 0
+  if (!text && !hasImages) return
+  hideSlash()
+  // Slash commands run client-side and never reach the server.
+  if (text.startsWith("/")) {
+    const known = SLASH_COMMANDS.some((c) => text === c.cmd || text.startsWith(c.cmd + " "))
+    if (known) {
+      input.value = ""
+      input.style.height = "auto"
+      handleCommand(text)
+      return
+    }
+  }
   if (!sessionId) {
     // No session yet (e.g. creation failed on load) — don't fail silently.
     if (!(await newSession())) return
   }
+  let images
+  if (hasImages) {
+    try {
+      images = await readImages()
+    } catch {
+      errorLine("Could not read one of the attached images")
+      return
+    }
+  }
   input.value = ""
   input.style.height = "auto"
-  userMsg(text)
+  clearImages()
+  userMsg(
+    text,
+    images ? images.map((im) => ({ url: `data:${im.mediaType};base64,${im.data}`, name: "" })) : undefined,
+  )
   setBusy(true)
-  const res = await fetch(`/api/sessions/${sessionId}/messages`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text }),
-  }).catch(() => null)
+  const body = { text, images }
+  const res = await postMessage(body)
   if (!res) {
     errorLine("Could not reach the anvil server")
     setStatus("error", "error")
@@ -949,13 +1201,9 @@ async function sendNow() {
       // Start fresh and retry the message once.
       setBusy(false)
       if (!(await newSession())) return
-      userMsg(text)
+      userMsg(text, images ? images.map((im) => ({ url: `data:${im.mediaType};base64,${im.data}`, name: "" })) : undefined)
       setBusy(true)
-      const retry = await fetch(`/api/sessions/${sessionId}/messages`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text }),
-      }).catch(() => null)
+      const retry = await postMessage(body)
       if (!retry) {
         errorLine("Could not reach the anvil server")
         setStatus("error", "error")
@@ -987,46 +1235,303 @@ async function abortTurn() {
   toast("Turn stopped", "ok")
 }
 
+async function setModel(model) {
+  if (!sessionId || !model) return
+  const res = await fetch(`/api/sessions/${sessionId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model }),
+  }).catch(() => null)
+  if (!res || !res.ok) {
+    const err = res ? (await res.json().catch(() => ({}))) : {}
+    toast(err.error ?? "Could not switch the model", "err")
+    await refreshState() // reverts the pill
+    return
+  }
+  const s = await res.json()
+  setModelPill(s)
+  toast(`Model: ${model}`, "ok")
+}
+
+async function applyThinking(level) {
+  if (!sessionId) return
+  const res = await fetch(`/api/sessions/${sessionId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ thinking: level }),
+  }).catch(() => null)
+  if (!res || !res.ok) {
+    toast("Could not change the thinking level", "err")
+    return
+  }
+  const s = await res.json()
+  setModelPill(s)
+  toast(`Thinking: ${level}`, "ok")
+}
+
+async function applyMode(mode) {
+  if (!sessionId) return
+  const res = await fetch(`/api/sessions/${sessionId}/mode`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode }),
+  }).catch(() => null)
+  if (!res || !res.ok) {
+    $("mode").value = "default"
+    toast("Could not change the mode", "err")
+    return
+  }
+  $("mode").value = mode
+}
+
 function wireComposer() {
   const input = $("input")
-  input.addEventListener("input", grow)
+  input.addEventListener("input", () => {
+    grow()
+    updateSlash()
+  })
   input.addEventListener("keydown", (e) => {
+    const pop = slashPop()
+    if (!pop.hidden) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault()
+        slashIdx = (slashIdx + (e.key === "ArrowDown" ? 1 : pop.children.length - 1)) % pop.children.length
+        updateSlash()
+        return
+      }
+      if (e.key === "Tab" || e.key === "Enter") {
+        e.preventDefault()
+        const active = pop.children[slashIdx]
+        const usage = active?.querySelector(".slash-cmd")?.textContent ?? ""
+        pickSlash(usage.split(" ")[0])
+        return
+      }
+      if (e.key === "Escape") {
+        e.preventDefault()
+        hideSlash()
+        return
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault()
       sendNow()
     }
   })
+  // Pasted images (from clipboard) land in the composer.
+  input.addEventListener("paste", (e) => {
+    const items = e.clipboardData ? [...e.clipboardData.items] : []
+    const files = items.filter((i) => i.kind === "file").map((i) => i.getAsFile()).filter(Boolean)
+    if (files.length) {
+      e.preventDefault()
+      addImageFiles(files)
+    }
+  })
+
   $("send").addEventListener("click", () => (busy ? abortTurn() : sendNow()))
-  $("mode").addEventListener("change", async (e) => {
-    if (!sessionId) return
-    const res = await fetch(`/api/sessions/${sessionId}/mode`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ mode: e.target.value }),
-    }).catch(() => null)
-    if (!res || !res.ok) {
-      e.target.value = "default"
-      toast("Could not change the mode", "err")
+  $("mode").addEventListener("change", (e) => applyMode(e.target.value))
+  $("model").addEventListener("change", (e) => {
+    if (e.target.value) setModel(e.target.value)
+  })
+
+  // Image attachment: file picker, drag & drop onto the composer.
+  $("attach-btn").addEventListener("click", () => $("img-input").click())
+  $("img-input").addEventListener("change", (e) => {
+    addImageFiles([...(e.target.files ?? [])])
+    e.target.value = ""
+  })
+  const composer = $("composer")
+  composer.addEventListener("dragover", (e) => {
+    e.preventDefault()
+    composer.classList.add("drag")
+  })
+  composer.addEventListener("dragleave", () => composer.classList.remove("drag"))
+  composer.addEventListener("drop", (e) => {
+    e.preventDefault()
+    composer.classList.remove("drag")
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+      addImageFiles([...e.dataTransfer.files])
     }
   })
-  $("model").addEventListener("change", async (e) => {
-    if (!sessionId || !e.target.value) return
-    const model = e.target.value
-    const res = await fetch(`/api/sessions/${sessionId}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model }),
-    }).catch(() => null)
-    if (!res || !res.ok) {
-      const err = res ? (await res.json().catch(() => ({}))) : {}
-      toast(err.error ?? "Could not switch the model", "err")
-      await refreshState() // reverts the pill
-      return
+}
+
+// ---------------------------------------------------------------- notifications
+
+function notifyEnabled() {
+  try {
+    return localStorage.getItem("anvil-notify") !== "0"
+  } catch {
+    return true
+  }
+}
+
+function syncNotifyBtn() {
+  const b = $("notify-btn")
+  if (!b) return
+  const on = "Notification" in window && Notification.permission === "granted" && notifyEnabled()
+  b.classList.toggle("active", on)
+  b.title = on ? "Notifications: on (when this tab is hidden)" : "Notifications: off"
+}
+
+async function toggleNotify(forceOff) {
+  if (!("Notification" in window)) {
+    toast("This browser does not support notifications", "err")
+    return
+  }
+  if (forceOff) {
+    try {
+      localStorage.setItem("anvil-notify", "0")
+    } catch {}
+    syncNotifyBtn()
+    toast("Notifications off", "info")
+    return
+  }
+  let perm = Notification.permission
+  if (perm === "default") {
+    try {
+      perm = await Notification.requestPermission()
+    } catch {}
+  }
+  if (perm === "granted") {
+    try {
+      localStorage.setItem("anvil-notify", notifyEnabled() ? "0" : "1")
+    } catch {}
+    syncNotifyBtn()
+    toast(notifyEnabled() ? "Notifications off" : "Notifications on", "info")
+  } else {
+    toast("The browser blocked notifications", "err")
+  }
+}
+
+/** Fire only while the tab is hidden — never compete with the UI. */
+function maybeNotify(title, body) {
+  if (!("Notification" in window)) return
+  if (Notification.permission !== "granted") return
+  if (!notifyEnabled()) return
+  if (!document.hidden) return
+  try {
+    const n = new Notification(title, { body: body || "anvil", tag: "anvil" })
+    n.onclick = () => {
+      window.focus()
+      n.close()
     }
-    const s = await res.json()
-    setModelPill(s)
-    toast(`Model: ${model}`, "ok")
-  })
+  } catch {}
+}
+
+// ---------------------------------------------------------------- export
+
+async function doExport(fmt) {
+  if (!sessionId) return
+  const [tRes, sRes] = await Promise.all([
+    fetch(`/api/sessions/${sessionId}/transcript`).catch(() => null),
+    fetch(`/api/sessions/${sessionId}`).catch(() => null),
+  ])
+  if (!tRes || !tRes.ok || !sRes || !sRes.ok) {
+    toast("Could not load the session for export", "err")
+    return
+  }
+  const entries = (await tRes.json()).entries ?? []
+  const s = await sRes.json()
+  const date = new Date().toISOString().slice(0, 10)
+  const slug =
+    String(s.title || "session").toLowerCase().replace(/[^\w]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "session"
+  const name = `anvil-${slug}-${date}`
+  if (fmt === "html") download(name + ".html", buildExportHtml(s, entries), "text/html")
+  else download(name + ".md", buildExportMd(s, entries), "text/markdown")
+  toast(`Exported as ${fmt.toUpperCase()}`, "ok")
+}
+
+function toolLine(e) {
+  const args = formatInput(e.name, e.args)
+  return `${e.name}${args ? " — " + args : ""}${e.ok ? "" : "  (failed)"}`
+}
+
+function buildExportMd(s, entries) {
+  const L = []
+  L.push(`# ${s.title || "anvil session"}`, "")
+  L.push(`anvil · ${s.model ?? ""} · ${s.cwd ?? ""} · ${new Date(s.createdAt || Date.now()).toLocaleString()}`)
+  const u = s.usage ?? {}
+  if (u.input || u.output) L.push("", `tokens: ${u.input} in / ${u.output} out`)
+  for (const e of entries) {
+    if (e.role === "user") {
+      L.push("", "## You", "", e.text || "")
+      for (const im of e.images ?? []) {
+        L.push(`_image attached: ${im.mediaType} (${Math.round((im.data?.length ?? 0) / 1024)} KB — omitted from export)_`)
+      }
+    } else if (e.role === "assistant") {
+      L.push("", "## anvil", "", e.text)
+    } else if (e.role === "tool") {
+      L.push("", `### ${toolLine(e)}`, "", "```json", JSON.stringify(e.args ?? {}), "```")
+      if (e.output) L.push("", "```", String(e.output).slice(0, 8000), "```")
+    }
+  }
+  L.push("")
+  return L.join("\n")
+}
+
+function buildExportHtml(s, entries) {
+  const u = s.usage ?? {}
+  const meta = [s.model, s.cwd, new Date(s.createdAt || Date.now()).toLocaleString()].filter(Boolean).map(escapeHtml).join(" · ")
+  const body = []
+  for (const e of entries) {
+    if (e.role === "user") {
+      body.push(`<section class="msg user"><div class="who">you</div>${e.text ? `<div class="user-text">${renderMarkdown(e.text)}</div>` : ""}`)
+      for (const im of e.images ?? []) body.push(`<img src="data:${im.mediaType};base64,${im.data}" alt="attached image">`)
+      body.push("</section>")
+    } else if (e.role === "assistant") {
+      body.push(`<section class="msg assistant"><div class="who">anvil</div>${renderMarkdown(e.text) || ""}</section>`)
+    } else if (e.role === "tool") {
+      body.push(
+        `<section class="tool"><div class="tool-line">${escapeHtml(toolLine(e))}</div><pre>${escapeHtml(JSON.stringify(e.args ?? {}, null, 2))}</pre>${e.output ? `<pre class="tool-out">${escapeHtml(String(e.output).slice(0, 8000))}</pre>` : ""}</section>`,
+      )
+    }
+  }
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(s.title || "anvil session")}</title>
+<style>
+:root{color-scheme:light dark;--bg:#ffffff;--fg:#1c1e21;--muted:#6b7280;--card:#f4f5f7;--border:#e3e5e8;--code:#0f1115;--code-fg:#e6e6e6}
+@media (prefers-color-scheme:dark){:root{--bg:#111318;--fg:#e7eaf0;--muted:#98a2b3;--card:#1a1e26;--border:#2a3039;--code:#0b0e12;--code-fg:#e6e6e6}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 ui-sans-serif,system-ui,"Segoe UI",sans-serif}
+article{max-width:860px;margin:0 auto;padding:48px 24px 80px}
+h1{font-size:26px;line-height:1.25}
+.meta{color:var(--muted);font-size:13px;margin-bottom:8px}
+.who{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:26px 0 6px}
+.msg.user .user-text{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 14px}
+.msg.user img{max-width:240px;border-radius:8px;margin:6px 6px 0 0}
+pre{background:var(--code);color:var(--code-fg);padding:12px 14px;border-radius:9px;overflow-x:auto;font-size:12.8px;line-height:1.55;font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+p>code,li>code{font-family:ui-monospace,Consolas,monospace;background:var(--card);border:1px solid var(--border);padding:1px 5px;border-radius:5px;font-size:.92em}
+.tool{border:1px solid var(--border);border-radius:9px;padding:10px 12px;margin:10px 0;font-size:13px}
+.tool-line{font-weight:600;color:var(--muted);margin-bottom:8px}
+code{font-family:ui-monospace,Consolas,monospace}
+a{color:#4a7fd6}
+blockquote{margin:8px 0;padding:6px 14px;border-left:3px solid var(--border);color:var(--muted)}
+</style>
+</head>
+<body>
+<article>
+<h1>${escapeHtml(s.title || "anvil session")}</h1>
+<div class="meta">${meta}${u.input || u.output ? ` · ${u.input} in / ${u.output} out tokens` : ""}</div>
+${body.join("\n")}
+</article>
+</body>
+</html>
+`
+}
+
+function download(name, content, mime) {
+  const blob = new Blob([content], { type: mime + ";charset=utf-8" })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement("a")
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 5000)
 }
 
 // ---------------------------------------------------------------- chrome
@@ -1078,6 +1583,34 @@ function wireChrome() {
       toast(url, "info")
     }
   })
+
+  $("notify-btn").addEventListener("click", () => toggleNotify())
+
+  // Todo chip (mobile only, via CSS): opens the sidebar where the panel lives.
+  $("todo-chip").addEventListener("click", () => {
+    $("sidebar").classList.add("open")
+    $("backdrop").classList.add("show")
+  })
+
+  // Export menu (md / html) in the top bar.
+  const exportMenu = $("export-menu")
+  $("export-btn").addEventListener("click", (e) => {
+    e.stopPropagation()
+    exportMenu.hidden = !exportMenu.hidden
+  })
+  document.addEventListener("click", () => {
+    exportMenu.hidden = true
+  })
+  for (const b of exportMenu.querySelectorAll("button")) {
+    b.addEventListener("click", (e) => {
+      e.stopPropagation()
+      exportMenu.hidden = true
+      doExport(b.dataset.fmt)
+    })
+  }
+
+  // Session list search.
+  $("sess-search").addEventListener("input", () => renderList(allSessions))
 
   $("settings-btn").addEventListener("click", openSettings)
   $("settings-close").addEventListener("click", closeSettings)
@@ -1243,6 +1776,7 @@ async function saveSettings() {
 
 async function init() {
   applyTheme(initialTheme())
+  syncNotifyBtn()
   wireComposer()
   wireChrome()
 

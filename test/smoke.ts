@@ -10,6 +10,8 @@ import { buildSystemPrompt, detectEnv } from "../src/prompt.ts"
 import { loadMemory } from "../src/memory.ts"
 import { createMainTools, createSubagentTools } from "../src/tools/index.ts"
 import { OpenAIProvider } from "../src/providers/openai.ts"
+import { lineDiff } from "../src/diff.ts"
+import { deleteSessionFile, listSessions, loadSession, saveSession, type StoredSession } from "../src/store.ts"
 import { createServer } from "node:http"
 import type { Message, Provider, ProviderRequest, ProviderResponse, Tool, ToolContext, ToolInput } from "../src/types.ts"
 
@@ -367,6 +369,38 @@ async function main(): Promise<void> {
     JSON.stringify(oaTool.toolUse),
   )
   check("tool call stop reason", oaTool.stop === "tool_use")
+
+  // an image attachment must become a multipart content array: text part
+  // first, then one image_url part per image (raw base64 → data: URL)
+  oaReq.messages = [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "what is in this picture?" },
+        { type: "image", mediaType: "image/png", data: "aW1hZ2Utbm90LXJlYWw=" },
+      ],
+    },
+  ]
+  nextSse = sse([
+    '{"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}',
+    '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+    "[DONE]",
+  ])
+  await oa.complete(oaReq, () => {})
+  const imgMsg = (capturedBody.messages as Array<Record<string, unknown>> | undefined)?.find(
+    (m) => m.role === "user",
+  ) as { content?: unknown } | undefined
+  const imgParts = (Array.isArray(imgMsg?.content) ? (imgMsg.content as unknown[]) : []) as Array<Record<string, unknown>>
+  check(
+    "image turn sends multipart content array",
+    imgParts.length === 2 && imgParts[0]?.type === "text" && imgParts[1]?.type === "image_url",
+    JSON.stringify(imgMsg?.content),
+  )
+  check(
+    "image part carries base64 data url",
+    (imgParts[1]?.image_url as { url?: string } | undefined)?.url === "data:image/png;base64,aW1hZ2Utbm90LXJlYWw=",
+    JSON.stringify(imgParts[1]),
+  )
   // Close the server fully before the process exits: on Windows, exiting
   // while the client's keep-alive socket is still closing trips a libuv
   // assertion. "connection: close" (above) plus the drain below make the
@@ -430,6 +464,136 @@ async function main(): Promise<void> {
     ctx,
   )
   check("TodoWrite rejects two in_progress items", !badTodo.ok)
+
+  console.log("\n— line diff —")
+  {
+    const same = lineDiff("a\nb\nc", "a\nb\nc")
+    check("identical → no changes", same.additions === 0 && same.deletions === 0 && !same.truncated)
+
+    const mid = lineDiff("a\nb\nc", "a\nX\nY\nc")
+    check(
+      "middle edit aligns via LCS (1 del, 2 add)",
+      mid.additions === 2 && mid.deletions === 1,
+      JSON.stringify({ a: mid.additions, d: mid.deletions }),
+    )
+    check(
+      "line numbers track both sides",
+      mid.lines.some((l) => l.t === "del" && l.no === 2 && l.nn === null) &&
+        mid.lines.some((l) => l.t === "add" && l.nn === 2 && l.no === null),
+    )
+
+    const moved = lineDiff("a\nb\nc\nd", "c\nd\na\nb")
+    check("moved block counted as del+add (no false ctx)", moved.deletions === 2 && moved.additions === 2, JSON.stringify({ a: moved.additions, d: moved.deletions }))
+
+    const crlf = lineDiff("a\r\nb\r\nc", "a\nb\nc")
+    check("CRLF vs LF → identical", crlf.additions === 0 && crlf.deletions === 0)
+
+    const emptyOld = lineDiff("", "one\ntwo")
+    check("empty old → pure additions", emptyOld.additions === 2 && emptyOld.deletions === 0)
+
+    // 400 vs 400 disjoint lines: middle (400×400) exceeds the LCS budget,
+    // so the fallback reports 400 del + 400 add, then the cap trims to
+    // 250 + gap + 250 rows with the full stats preserved.
+    const bigOld = Array.from({ length: 400 }, (_, i) => `old-${i}`).join("\n")
+    const bigNew = Array.from({ length: 400 }, (_, i) => `new-${i}`).join("\n")
+    const big = lineDiff(bigOld, bigNew)
+    check("big rewrite capped at 501 rows (250+gap+250)", big.lines.length === 501, `rows=${big.lines.length}`)
+    check("big rewrite flagged truncated", big.truncated === true)
+    check("big rewrite keeps full stats", big.additions === 400 && big.deletions === 400)
+    check("gap marker reports hidden rows", big.lines[250]?.gap === 300, `gap=${big.lines[250]?.gap}`)
+  }
+
+  console.log("\n— session store (hermetic via $ANVIL_CONFIG) —")
+  {
+    const cfg = join(dir, "anvil-config", "anvil.json")
+    process.env.ANVIL_CONFIG = cfg
+    try {
+      const now = Date.now()
+      const hist: Message[] = [
+        { role: "user", content: [{ type: "text", text: "hello there" }] },
+        { role: "assistant", content: [{ type: "text", text: "hi!" }] },
+      ]
+      const mk = (id: string, updated: number): StoredSession => ({
+        id,
+        title: `title-${id}`,
+        kind: "hsnr",
+        model: "test-model",
+        thinking: "off",
+        mode: "default",
+        cwd: dir,
+        createdAt: now,
+        updatedAt: updated,
+        usage: { input: 10, output: 5 },
+        forkedFrom: null,
+        history: hist,
+        todos: [],
+      })
+      await saveSession(mk("aaa111", now))
+      await saveSession(mk("bbb222", now + 1000))
+
+      const loaded = await loadSession("aaa111")
+      check("store roundtrip", loaded?.title === "title-aaa111" && loaded?.history.length === 2)
+
+      const byPrefix = await loadSession("bb")
+      check("store loads by unique prefix", byPrefix?.id === "bbb222")
+
+      const list = await listSessions()
+      check(
+        "store lists newest first",
+        list.length === 2 && list[0].id === "bbb222",
+        JSON.stringify(list.map((m) => m.id)),
+      )
+      check("store meta counts user turns", list[0].turns === 1, `turns=${list[0].turns}`)
+
+      await deleteSessionFile("aaa111")
+      check("store delete removes file", (await loadSession("aaa111")) === null)
+    } finally {
+      delete process.env.ANVIL_CONFIG
+    }
+  }
+
+  console.log("\n— web/md.js (isomorphic markdown) —")
+  {
+    const md = await import("../web/md.js")
+    const esc = md.escapeHtml('<b>&"')
+    check("escapeHtml neutralizes markup", esc === "&lt;b&gt;&amp;&quot;", esc)
+
+    const h = md.renderMarkdown("# Title\n\nSome **bold** and `code` here.")
+    check(
+      "heading demotion + inline styles",
+      h.includes("<h2>Title</h2>") && h.includes("<strong>bold</strong>") && h.includes("<code>code</code>"),
+      h,
+    )
+
+    const fence = md.renderMarkdown("before\n\n```js\nconst x = 1 // c\n```\n\nafter")
+    check(
+      "fenced block with language + highlighting",
+      fence.includes('cb-lang">js') && fence.includes("tk-k") && fence.includes("tk-c"),
+      fence,
+    )
+
+    const open = md.renderMarkdown("text\n\n```py\ndef f():\n    return 1")
+    check(
+      "unclosed fence renders while streaming",
+      open.includes('cb-lang">py') && open.includes("return"),
+      open,
+    )
+
+    const misc = md.renderMarkdown("- one\n- two\n\n1. first\n2. second\n\n> quoted\n\n---")
+    check(
+      "lists, blockquote and hr",
+      misc.includes("<ul>") &&
+        misc.includes("<li>one</li>") &&
+        misc.includes("<ol>") &&
+        misc.includes("<li>first</li>") &&
+        misc.includes("<blockquote>quoted</blockquote>") &&
+        misc.includes("<hr>"),
+      misc,
+    )
+
+    const inj = md.renderMarkdown("<script>alert(1)</script>")
+    check("html in source stays escaped", inj.includes("&lt;script&gt;") && !inj.includes("<script>"))
+  }
 
   await rm(dir, { recursive: true, force: true })
   console.log(failures === 0 ? "\nALL TESTS PASSED" : `\n${failures} TEST(S) FAILED`)

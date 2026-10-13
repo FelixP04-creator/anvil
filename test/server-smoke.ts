@@ -86,8 +86,9 @@ async function main(): Promise<void> {
       text: "",
       toolUse: [tu("t1", "Write", { file_path: join(dir, "note.txt"), content: "hello anvil" })],
       stop: "tool_use",
+      usage: { input: 11, output: 7 },
     },
-    { text: "Wrote note.txt.", toolUse: [], stop: "end_turn" },
+    { text: "Wrote note.txt.", toolUse: [], stop: "end_turn", usage: { input: 13, output: 4 } },
   ])
   const server = new AnvilServer({ provider, kind: "anthropic", model: "mock-model", thinking: "off", cwd: dir })
   const port = await server.listen(0)
@@ -184,6 +185,31 @@ async function main(): Promise<void> {
   const file = await readFile(join(dir, "note.txt"), "utf8")
   check("file written through the server", file === "hello anvil")
 
+  const fc1 = events.find((e: any) => e.type === "file_change")
+  check(
+    "file_change event emitted for Write",
+    fc1?.path === join(dir, "note.txt") && fc1?.kind === "write" && fc1?.additions === 1 && fc1?.deletions === 0,
+    JSON.stringify(fc1),
+  )
+  check(
+    "file_change carries the diff rows",
+    Array.isArray(fc1?.diff) && fc1?.diff?.some((l: any) => l.t === "add" && l.text === "hello anvil"),
+    JSON.stringify(fc1?.diff),
+  )
+  const te = events.find((e: any) => e.type === "turn_end")
+  check(
+    "turn_end carries per-turn usage",
+    typeof te?.usage?.input === "number" && typeof te?.usage?.output === "number" && te.usage.input === 24 && te.usage.output === 11,
+    JSON.stringify(te?.usage),
+  )
+  check(
+    "turn_end lists the file changes",
+    Array.isArray(te?.changes) && te.changes.length === 1 && te.changes[0]?.path === join(dir, "note.txt"),
+  )
+  check("turn_end carries msgCount", typeof te?.msgCount === "number" && te.msgCount === 4, `msgCount=${te?.msgCount}`)
+  const atEv = events.find((e: any) => e.type === "assistant_text")
+  check("assistant_text carries the fork point", atEv?.msgIndex === 3, `msgIndex=${atEv?.msgIndex}`)
+
   console.log("\n— session state & mode —")
   const state1 = await (await fetch(`${base}/api/sessions/${id}`)).json()
   check("turn counted", state1.turns === 1)
@@ -267,6 +293,218 @@ async function main(): Promise<void> {
   check("session list contains the session", !!entry)
   check("list entry has an auto title", entry?.title === "create note.txt")
   check("list entry carries turn count", entry?.turns === 1)
+
+  /** Open SSE, post a message, collect events until turn_end, then cancel. */
+  async function runTurn(
+    sid: string,
+    body: Record<string, unknown>,
+    onEvent?: (e: any) => Promise<void> | void,
+  ): Promise<any[]> {
+    const sseRes = await fetch(`${base}/api/sessions/${sid}/events`)
+    const events: any[] = []
+    const done = new Promise<void>((resolve) => {
+      let settled = false
+      const p = (async () => {
+        const reader = sseRes.body!.getReader()
+        const decoder = new TextDecoder()
+        let buf = ""
+        for (;;) {
+          const { done: d, value } = await reader.read()
+          if (d) break
+          buf += decoder.decode(value, { stream: true })
+          let sep: number
+          while ((sep = buf.indexOf("\n\n")) !== -1) {
+            const raw = buf.slice(0, sep)
+            buf = buf.slice(sep + 2)
+            for (const line of raw.split("\n")) {
+              if (!line.startsWith("data:")) continue
+              const e = JSON.parse(line.slice(5).trim())
+              events.push(e)
+              if (!settled && e.type === "turn_end") {
+                settled = true
+                resolve()
+              }
+              if (onEvent) await onEvent(e)
+            }
+          }
+          if (settled) {
+            await reader.cancel().catch(() => {})
+            break
+          }
+        }
+      })()
+      void p
+    })
+    await new Promise((r) => setTimeout(r, 120))
+    const res = await fetch(`${base}/api/sessions/${sid}/messages`, {
+      method: "POST",
+      headers: jsonHdr,
+      body: JSON.stringify(body),
+    })
+    if (res.status !== 202) throw new Error(`message not accepted (HTTP ${res.status})`)
+    await done
+    return events
+  }
+
+  console.log("\n— edit turn (file_change on Edit) —")
+  // The mode tests above left the session in "plan" mode, where Write/Edit
+  // are denied outright — switch to acceptEdits so the turn runs unattended.
+  const modeReset = await fetch(`${base}/api/sessions/${id}/mode`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ mode: "acceptEdits" }),
+  })
+  check("mode reset to acceptEdits", (await modeReset.json()).ok === true)
+
+  provider.script.push(
+    {
+      text: "",
+      toolUse: [tu("t5", "Edit", { file_path: join(dir, "note.txt"), old_string: "hello anvil", new_string: "hello anvil v2" })],
+      stop: "tool_use",
+      usage: { input: 15, output: 6 },
+    },
+    { text: "Updated the note.", toolUse: [], stop: "end_turn", usage: { input: 9, output: 3 } },
+  )
+  const events2 = await runTurn(id, { text: "update note.txt" }, async (e) => {
+    if (e.type === "permission_request") {
+      await fetch(`${base}/api/sessions/${id}/permissions`, {
+        method: "POST",
+        headers: jsonHdr,
+        body: JSON.stringify({ id: e.id, answer: "once" }),
+      })
+    }
+  })
+  const fc2 = events2.find((e: any) => e.type === "file_change")
+  check(
+    "file_change emitted for Edit (1 add, 1 del)",
+    fc2?.kind === "edit" && fc2?.additions === 1 && fc2?.deletions === 1,
+    JSON.stringify(fc2),
+  )
+  check(
+    "edit diff shows the replaced line",
+    fc2?.diff?.some((l: any) => l.t === "del" && l.text === "hello anvil") &&
+      fc2?.diff?.some((l: any) => l.t === "add" && l.text === "hello anvil v2"),
+    JSON.stringify(fc2?.diff),
+  )
+  check("file updated through the server", (await readFile(join(dir, "note.txt"), "utf8")) === "hello anvil v2")
+  const stateEdits = await (await fetch(`${base}/api/sessions/${id}`)).json()
+  check(
+    "state carries the last turn's changes",
+    Array.isArray(stateEdits.changes) && stateEdits.changes.length === 1 && stateEdits.changes[0]?.kind === "edit",
+    JSON.stringify(stateEdits.changes?.map((c: any) => c.kind)),
+  )
+
+  console.log("\n— image message —")
+  provider.script.push({ text: "I see the picture.", toolUse: [], stop: "end_turn", usage: { input: 21, output: 5 } })
+  const imgB64 = Buffer.from("fake-png-bytes-for-anvil").toString("base64")
+  const events3 = await runTurn(id, {
+    text: "what do you see?",
+    images: [{ mediaType: "image/png", data: imgB64 }],
+  })
+  check("image answer streamed", events3.some((e: any) => e.type === "assistant_text" && String(e.text).includes("picture")))
+  const tr3 = await (await fetch(`${base}/api/sessions/${id}/transcript`)).json()
+  const userImg = (tr3.entries ?? []).find((e: any) => e.role === "user" && Array.isArray(e.images) && e.images.length === 1)
+  check(
+    "transcript keeps the attached image",
+    userImg?.images?.[0]?.mediaType === "image/png" && userImg?.images?.[0]?.data === imgB64,
+    JSON.stringify(userImg?.images),
+  )
+  const badImg = await fetch(`${base}/api/sessions/${id}/messages`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ images: [{ mediaType: "text/plain", data: "zz" }] }),
+  })
+  check("non-image attachment rejected (400)", badImg.status === 400, `status=${badImg.status}`)
+
+  console.log("\n— fork —")
+  const forkRes = await fetch(`${base}/api/sessions/${id}/fork`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ msgIndex: 0 }),
+  })
+  check("fork accepted (201)", forkRes.status === 201)
+  const forked = await forkRes.json()
+  check("fork has a new id", typeof forked.id === "string" && forked.id !== id)
+  check(
+    "fork records its origin",
+    forked.forkedFrom?.id === id && forked.forkedFrom?.at === 0,
+    JSON.stringify(forked.forkedFrom),
+  )
+  const forkState = await (await fetch(`${base}/api/sessions/${forked.id}`)).json()
+  check("fork history cut at the point", forkState.msgCount === 1, `msgCount=${forkState.msgCount}`)
+  const forkTr = await (await fetch(`${base}/api/sessions/${forked.id}/transcript`)).json()
+  check(
+    "fork transcript holds only the first turn",
+    (forkTr.entries ?? []).length === 1 && forkTr.entries[0]?.role === "user",
+    JSON.stringify(forkTr.entries),
+  )
+
+  // A fork point inside a tool_use/tool_result pair is clamped back to the
+  // previous message boundary (msgIndex 1 is the first assistant tool_use).
+  const forkRes2 = await fetch(`${base}/api/sessions/${id}/fork`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ msgIndex: 1 }),
+  })
+  const forked2 = await forkRes2.json()
+  check(
+    "fork clamps off tool_use messages",
+    forkRes2.status === 201 && forked2.forkedFrom?.at === 0,
+    JSON.stringify(forked2.forkedFrom),
+  )
+
+  const forkRes3 = await fetch(`${base}/api/sessions/${id}/fork`, { method: "POST", headers: jsonHdr, body: JSON.stringify({}) })
+  check("fork without msgIndex duplicates the session", forkRes3.status === 201)
+
+  const emptySess = await (
+    await fetch(`${base}/api/sessions`, { method: "POST", headers: jsonHdr, body: JSON.stringify({}) })
+  ).json()
+  const forkEmpty = await fetch(`${base}/api/sessions/${emptySess.id}/fork`, { method: "POST", headers: jsonHdr, body: JSON.stringify({}) })
+  check("fork of an empty session → 400", forkEmpty.status === 400)
+
+  console.log("\n— persistence —")
+  const sessionsDir = join(dir, "anvil-sessions")
+  const sessionFile = join(sessionsDir, `${id}.json`)
+  const diskRaw = await (async () => {
+    for (let i = 0; i < 100; i++) {
+      try {
+        return await readFile(sessionFile, "utf8")
+      } catch {
+        await new Promise((r) => setTimeout(r, 25))
+      }
+    }
+    return null
+  })()
+  check("session file written next to config", diskRaw !== null && JSON.parse(diskRaw).id === id)
+  check("session file stores usage totals", JSON.parse(diskRaw!).usage.input === 69 && JSON.parse(diskRaw!).usage.output === 25, JSON.stringify(JSON.parse(diskRaw!).usage))
+
+  const sessList = await (await fetch(`${base}/api/sessions`)).json()
+  const listEntry = (sessList.sessions ?? []).find((s: any) => s.id === id)
+  check("session list contains the persisted session", !!listEntry)
+  check("list entry carries usage totals", listEntry?.usage?.input === 69 && listEntry?.usage?.output === 25, JSON.stringify(listEntry?.usage))
+  check("list entry carries updatedAt", typeof listEntry?.updatedAt === "number")
+
+  console.log("\n— persistence: adoption across a restart —")
+  const server3 = new AnvilServer({ provider: new MockProvider([]), kind: "anthropic", model: "mock-model", thinking: "off", cwd: dir })
+  const port3 = await server3.listen(0)
+  const base3 = `http://127.0.0.1:${port3}`
+  const list3 = await (await fetch(`${base3}/api/sessions`)).json()
+  check("second server lists persisted sessions", (list3.sessions ?? []).some((s: any) => s.id === id))
+
+  const adoptState = await fetch(`${base3}/api/sessions/${id}`)
+  check("second server adopts the session on demand", adoptState.status === 200)
+  const adoptBody = await adoptState.json()
+  check("adopted session keeps its history", adoptBody.msgCount === 10, `msgCount=${adoptBody.msgCount}`)
+  check("adopted session is idle", adoptBody.busy === false)
+  check("adopted session keeps its model override", adoptBody.model === "custom-model", `model=${adoptBody.model}`)
+
+  // Deleting from the second server removes the on-disk file.
+  const delFork = await fetch(`${base3}/api/sessions/${forked2.id}`, { method: "DELETE" })
+  check("delete on second server ok", delFork.status === 200)
+  const forkFileGone = await readFile(join(sessionsDir, `${forked2.id}.json`), "utf8").catch(() => null)
+  check("delete removes the on-disk file", forkFileGone === null)
+
+  await server3.close()
 
   console.log("\n— config API —")
   const cfgGet0 = await (await fetch(`${base}/api/config`)).json()
@@ -393,6 +631,10 @@ async function main(): Promise<void> {
     throw new Error("turn never parked at a permission prompt")
   })()
   check("second turn parked at a permission prompt", parked.pendingPermission?.toolName === "Write")
+
+  // Forking a busy session must be rejected (the history is in flux).
+  const forkBusy = await fetch(`${base2}/api/sessions/${id2}/fork`, { method: "POST", headers: jsonHdr, body: JSON.stringify({}) })
+  check("fork while busy → 409", forkBusy.status === 409)
 
   const abortRes = await fetch(`${base2}/api/sessions/${id2}/abort`, { method: "POST" })
   check("abort accepted while busy", (await abortRes.json()).stopped === true)

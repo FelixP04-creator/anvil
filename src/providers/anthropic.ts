@@ -49,6 +49,12 @@ function toApiMessages(messages: Message[]): unknown[] {
         if (b.signature) out.signature = b.signature
         return out
       }
+      if (b.type === "image") {
+        return {
+          type: "image",
+          source: { type: "base64", media_type: b.mediaType, data: b.data },
+        }
+      }
       return b
     }),
   }))

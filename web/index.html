@@ -31,6 +31,7 @@
         <kbd class="side-kbd">N</kbd>
       </button>
 
+      <input id="sess-search" type="search" placeholder="Search sessions…" spellcheck="false" autocomplete="off" aria-label="Search sessions">
       <nav id="session-list" aria-label="Sessions"></nav>
 
       <section id="todo-panel">
@@ -63,6 +64,20 @@
           </select>
           <select id="model" title="Model — change applies from the next message"></select>
           <span id="cwd" class="pill mono" title="Working directory">…</span>
+          <button id="todo-chip" class="pill mono" hidden title="Open tasks (in the session menu)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6.5 5.5 8 8 5"/><path d="M4 12.5 5.5 14 8 11"/><path d="M11.5 7h9M11.5 13h9M11.5 19h9M4 19h.01"/></svg>
+            <span id="todo-chip-count"></span>
+          </button>
+          <button id="notify-btn" class="icon-btn" title="Notifications (when this tab is hidden)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M18 9a6 6 0 1 0-12 0c0 6-2.5 7-2.5 7h17S18 15 18 9z"/><path d="M10 20a2.2 2.2 0 0 0 4 0"/></svg>
+          </button>
+          <button id="export-btn" class="icon-btn" title="Export conversation (Markdown / HTML)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5V15M7.5 10.5 12 15l4.5-4.5"/><path d="M4.5 19.5h15"/></svg>
+          </button>
+          <div id="export-menu" hidden>
+            <button type="button" data-fmt="md">Markdown <span class="em-ext">.md</span></button>
+            <button type="button" data-fmt="html">HTML <span class="em-ext">.html</span></button>
+          </div>
           <button id="settings-btn" class="icon-btn" title="Settings (provider, keys, model, thinking)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.58 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.65 8.86a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.08A1.7 1.7 0 0 0 10.12 3V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.08a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51.88z"/></svg>
           </button>
@@ -99,8 +114,14 @@
           <span id="status" class="status"><span class="status-dot"></span><span id="status-text">idle</span></span>
           <span id="tokens"></span>
         </div>
+        <div id="img-previews" hidden></div>
+        <div id="slash-pop" hidden></div>
         <div class="composer-box">
-          <textarea id="input" rows="1" placeholder="Describe a task…"></textarea>
+          <button id="attach-btn" class="icon-btn attach" title="Attach images (or paste / drag &amp; drop)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5 12.5 20a5 5 0 0 1-7-7L14 4.5a3.3 3.3 0 0 1 4.7 4.7L10 18a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></svg>
+          </button>
+          <input type="file" id="img-input" accept="image/*" multiple hidden>
+          <textarea id="input" rows="1" placeholder="Describe a task…  ( / for commands )"></textarea>
           <button id="send" title="Send (Enter)">
             <svg class="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12 20 4l-4 8 4 8-16-8z"/></svg>
             <svg class="i-stop" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
@@ -109,6 +130,7 @@
         <div class="composer-hint">
           <span><kbd>Enter</kbd> send</span>
           <span><kbd>Shift</kbd>+<kbd>Enter</kbd> newline</span>
+          <span><kbd>/</kbd> commands</span>
           <span><kbd>Esc</kbd> stop</span>
         </div>
       </footer>
@@ -176,6 +198,6 @@
     </div>
   </div>
 
-  <script src="/app.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

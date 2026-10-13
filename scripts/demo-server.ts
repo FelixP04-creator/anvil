@@ -6,8 +6,22 @@
 // Run this from the repository root. It prints the URL of a session that
 // has one finished turn and one turn waiting at a permission prompt.
 
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { AnvilServer } from "../src/server.ts"
 import type { Provider, ProviderRequest, ProviderResponse, ToolInput } from "../src/types.ts"
+
+// Keep the demo hermetic: sessions are persisted next to the config file
+// since v0.6.0 — point that at a throwaway temp dir instead of ~/.anvil.json.
+const demoHome = await mkdtemp(join(tmpdir(), "anvil-demo-"))
+process.env.ANVIL_CONFIG = join(demoHome, "anvil.json")
+const cleanup = () => void rm(demoHome, { recursive: true, force: true }).catch(() => {})
+process.on("exit", cleanup)
+process.on("SIGINT", () => {
+  cleanup()
+  process.exit(130)
+})
 
 const tu = (id: string, name: string, input: ToolInput) => ({ id, name, input })
 

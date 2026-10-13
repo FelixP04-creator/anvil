@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // anvil — an open-source coding agent for your terminal.
 
+import { randomUUID } from "node:crypto"
+
 import { runAgent, type AgentEvent, type AgentOptions } from "./agent.ts"
 import { PermissionEngine, type PermissionMode, formatCall } from "./permissions.ts"
 import { type ProviderKind } from "./providers/index.ts"
@@ -18,6 +20,7 @@ import { loadMemory } from "./memory.ts"
 import { createMainTools, createSubagentTools } from "./tools/index.ts"
 import { startRepl } from "./repl.ts"
 import { AnvilServer } from "./server.ts"
+import { listSessions, loadSession, saveSession, type StoredSession } from "./store.ts"
 import type { Message, ThinkingEffort, ToolContext } from "./types.ts"
 
 const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
@@ -28,6 +31,9 @@ function usage(): void {
 usage:
   anvil [task...]                  one-shot: run the task and print the result
   anvil                            interactive session
+  anvil -c [task...]               continue the most recent saved session
+  anvil -r <id> [task...]          resume a saved session (id prefix is enough)
+  anvil sessions                   list saved sessions
   anvil server [options]           start the web server (REST + SSE + web UI)
   anvil config [command]           show or change persistent settings
 
@@ -37,6 +43,8 @@ options:
   --thinking <level>    off | low | medium | high (extended thinking, default: off)
   --mode <mode>         default | acceptEdits | plan | bypass (default: default)
   --max-turns <n>       agent turn limit (default: 50)
+  -c, --continue        continue the most recent saved session (prefers this cwd)
+  -r, --resume <id>     resume the saved session with this id (prefix matches)
   -p, --print           force one-shot output even with a TTY
   -h, --help            this help
 
@@ -150,7 +158,7 @@ function runConfigCommand(args: string[]): void {
 }
 
 interface Args {
-  command: "run" | "server" | "config"
+  command: "run" | "server" | "config" | "sessions"
   task: string
   provider: ProviderKind | undefined
   model: string
@@ -161,6 +169,8 @@ interface Args {
   port: number
   cwd: string
   configArgs: string[]
+  cont: boolean
+  resume: string | null
 }
 
 function parseArgs(argv: string[]): Args {
@@ -175,10 +185,13 @@ function parseArgs(argv: string[]): Args {
   let print = false
   let port = 8787
   let cwd = process.cwd()
+  let cont = false
+  let resume: string | null = null
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === "server") command = "server"
+    else if (a === "sessions") command = "sessions"
     else if (a === "config") {
       command = "config"
       configArgs.push(...argv.slice(i + 1))
@@ -190,13 +203,39 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--max-turns") maxTurns = parseInt(argv[++i] ?? "50", 10) || 50
     else if (a === "--port") port = parseInt(argv[++i] ?? "8787", 10) || 8787
     else if (a === "--cwd") cwd = argv[++i] ?? cwd
+    else if (a === "-c" || a === "--continue") cont = true
+    else if (a === "-r" || a === "--resume") resume = argv[++i] ?? null
     else if (a === "-p" || a === "--print") print = true
     else if (a === "-h" || a === "--help") {
       usage()
       process.exit(0)
     } else parts.push(a)
   }
-  return { command, task: parts.join(" "), provider, model, thinking, mode, maxTurns, print, port, cwd, configArgs }
+  return { command, task: parts.join(" "), provider, model, thinking, mode, maxTurns, print, port, cwd, configArgs, cont, resume }
+}
+
+function ago(ts: number): string {
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000))
+  if (s < 60) return `${s}s ago`
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`
+  return `${Math.floor(s / 86400)}d ago`
+}
+
+async function runSessionsCommand(): Promise<void> {
+  const all = await listSessions()
+  if (all.length === 0) {
+    console.log("no saved sessions yet — start a session or run a one-shot first")
+    return
+  }
+  const here = process.cwd()
+  const fmt = (id: string) => id.slice(0, 8)
+  for (const m of all) {
+    const mark = m.cwd === here ? " •" : ""
+    const title = (m.title || "(untitled)").slice(0, 42)
+    console.log(`${fmt(m.id)}  ${ago(m.updatedAt).padStart(9)}  ${m.model.slice(0, 26).padEnd(26)}  ${String(m.turns).padStart(3)} turns  ${title}${mark}`)
+  }
+  console.log(`\nresume with: anvil -r <id>   (${all.length} session${all.length === 1 ? "" : "s"} total, • = current directory)`)
 }
 
 async function main(): Promise<void> {
@@ -212,6 +251,11 @@ async function main(): Promise<void> {
 
   if (args.command === "config") {
     runConfigCommand(args.configArgs)
+    return
+  }
+
+  if (args.command === "sessions") {
+    await runSessionsCommand()
     return
   }
 
@@ -233,10 +277,61 @@ async function main(): Promise<void> {
   }
 
   const workCwd = process.cwd()
-  const env = detectEnv(workCwd)
-  const system = buildSystemPrompt(env, loadMemory(workCwd), thinking !== "off")
-  const ctx: ToolContext = { cwd: workCwd, todos: [] }
+
+  // Resume support: -r <id> (exact id or unique prefix) or -c (most recent
+  // session, preferring one that was started in this directory).
+  let stored: StoredSession | null = null
+  if (args.resume) {
+    stored = await loadSession(args.resume)
+    if (!stored) {
+      console.error(`error: no saved session matching "${args.resume}" (see: anvil sessions)`)
+      process.exit(1)
+    }
+  } else if (args.cont) {
+    const all = await listSessions()
+    const pick = all.find((m) => m.cwd === workCwd) ?? all[0]
+    if (!pick) {
+      console.error("error: no saved sessions to continue (see: anvil sessions)")
+      process.exit(1)
+    }
+    stored = await loadSession(pick.id)
+  }
+
+  const cwd = stored?.cwd ?? workCwd
+  const env = detectEnv(cwd)
+  const system = buildSystemPrompt(env, loadMemory(cwd), thinking !== "off")
+  const ctx: ToolContext = { cwd, todos: stored?.todos ?? [] }
   const subagentTools = createSubagentTools()
+  const sessionId = stored?.id ?? randomUUID()
+
+  // Save after every turn — this is what makes -c / -r work later.
+  const usageTotal = { input: 0, output: 0 }
+  const firstUserText = (history: Message[]): string => {
+    for (const m of history) {
+      if (m.role !== "user") continue
+      for (const b of m.content) {
+        if (b.type === "text") return b.text
+      }
+    }
+    return "(untitled)"
+  }
+  const persist = (history: Message[]) => {
+    void saveSession({
+      id: sessionId,
+      title: firstUserText(history).slice(0, 64),
+      kind,
+      model,
+      thinking,
+      mode: args.mode,
+      cwd,
+      createdAt: stored?.createdAt ?? Date.now(),
+      updatedAt: Date.now(),
+      usage: { ...usageTotal },
+      forkedFrom: stored?.forkedFrom ?? null,
+      history,
+      todos: ctx.todos,
+    }).catch(() => {})
+  }
 
   const makeOptions = (engine: PermissionEngine): AgentOptions => ({
     provider,
@@ -258,7 +353,18 @@ async function main(): Promise<void> {
 
   const interactive = !args.task && !args.print && process.stdin.isTTY
   if (interactive) {
-    await startRepl({ makeOptions, ctx, mode: args.mode })
+    await startRepl({
+      makeOptions,
+      ctx,
+      mode: args.mode,
+      history: stored?.history ?? [],
+      sessionId,
+      onTurn: (h, u) => {
+        usageTotal.input += u.input
+        usageTotal.output += u.output
+        persist(h)
+      },
+    })
     return
   }
 
@@ -270,7 +376,10 @@ async function main(): Promise<void> {
   // One-shot mode: non-interactive, so anything needing confirmation is denied
   // unless the chosen mode auto-allows it.
   const engine = new PermissionEngine(args.mode, async () => "deny", false)
-  const history: Message[] = [{ role: "user", content: [{ type: "text", text: args.task }] }]
+  const history: Message[] = [
+    ...(stored?.history ?? []),
+    { role: "user", content: [{ type: "text", text: args.task }] },
+  ]
 
   let streamed = false
   let thought = false
@@ -304,6 +413,10 @@ async function main(): Promise<void> {
   if (result.usage.input || result.usage.output) {
     console.error(`(tokens: ${result.usage.input} in / ${result.usage.output} out, ${result.turns} turns)`)
   }
+  usageTotal.input += result.usage.input
+  usageTotal.output += result.usage.output
+  persist(history)
+  console.error(`session: ${sessionId} — resume later with: anvil -r ${sessionId}`)
 }
 
 main().catch((err) => {

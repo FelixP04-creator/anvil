@@ -74,7 +74,27 @@ function toOpenAIMessages(messages: Message[]): any[] {
       const texts = m.content
         .filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
         .map((b) => b.text)
-      if (texts.length) out.push({ role: "user", content: texts.join("") })
+      const images = m.content.filter(
+        (b): b is Extract<typeof b, { type: "image" }> => b.type === "image",
+      )
+      if (texts.length || images.length) {
+        if (images.length === 0) {
+          out.push({ role: "user", content: texts.join("") })
+        } else {
+          // Multimodal user turn: content becomes a part array with the
+          // text first and one image_url part per attached image.
+          out.push({
+            role: "user",
+            content: [
+              ...(texts.length ? [{ type: "text", text: texts.join("") }] : []),
+              ...images.map((b) => ({
+                type: "image_url",
+                image_url: { url: `data:${b.mediaType};base64,${b.data}` },
+              })),
+            ],
+          })
+        }
+      }
       for (const b of m.content) {
         if (b.type === "tool_result") {
           out.push({ role: "tool", tool_call_id: b.tool_use_id, content: b.content })

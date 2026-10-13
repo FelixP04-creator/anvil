@@ -3,11 +3,20 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
 import { existsSync, readFileSync } from "node:fs"
-import { dirname, join, normalize } from "node:path"
+import { readFile } from "node:fs/promises"
+import { dirname, isAbsolute, join, normalize } from "node:path"
 import { fileURLToPath } from "node:url"
 import { randomUUID } from "node:crypto"
 
 import { runAgent } from "./agent.ts"
+import { lineDiff, type DiffLine } from "./diff.ts"
+import {
+  deleteSessionFile,
+  listSessions,
+  loadSession,
+  saveSession,
+  type SessionMeta,
+} from "./store.ts"
 import { PermissionEngine, type AskAnswer, type AskFn, type PermissionMode } from "./permissions.ts"
 import { buildSubagentPrompt, buildSystemPrompt, detectEnv } from "./prompt.ts"
 import { loadMemory } from "./memory.ts"
@@ -23,9 +32,18 @@ import {
   type ResolvedSettings,
 } from "./config.ts"
 import type { ProviderKind } from "./providers/index.ts"
-import type { Message, Provider, ThinkingEffort, ToolContext, Tool, ToolInput } from "./types.ts"
+import type {
+  ContentBlock,
+  Message,
+  Provider,
+  ThinkingEffort,
+  Tool,
+  ToolContext,
+  ToolInput,
+  ToolResult,
+} from "./types.ts"
 
-export const VERSION = "0.5.3"
+export const VERSION = "0.6.0"
 export const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
 export const THINKING: ThinkingEffort[] = THINKING_LEVELS
 
@@ -57,10 +75,21 @@ interface ConfigView {
 export type ServerEvent = { type: string } & Record<string, unknown>
 
 export type TranscriptEntry =
-  | { role: "user"; text: string }
-  | { role: "assistant"; text: string }
-  | { role: "thinking"; text: string }
-  | { role: "tool"; name: string; args: ToolInput; ok: boolean; output: string; pending?: boolean }
+  | { role: "user"; text: string; msgIndex?: number; images?: { mediaType: string; data: string }[] }
+  | { role: "assistant"; text: string; msgIndex?: number }
+  | { role: "thinking"; text: string; msgIndex?: number }
+  | { role: "tool"; name: string; args: ToolInput; ok: boolean; output: string; pending?: boolean; msgIndex?: number }
+
+/** A file the agent changed this turn (for the live diff view + change panel). */
+export interface FileChange {
+  path: string
+  kind: "write" | "edit"
+  additions: number
+  deletions: number
+  diff: DiffLine[]
+  /** true when the change happened inside a subagent (Task tool). */
+  subagent?: boolean
+}
 
 /**
  * One web/CLI session: owns the conversation history, tool context and
@@ -79,7 +108,14 @@ export class Session {
   engine: PermissionEngine
   busy = false
   createdAt = Date.now()
+  updatedAt = Date.now()
   usage = { input: 0, output: 0 }
+  /** Set by the server so the session can persist itself to disk. */
+  persist: (() => void) | null = null
+  /** Where this session was forked from (if it was). */
+  forkedFrom: { id: string; at: number } | null = null
+  /** File changes of the current (or last finished) turn. */
+  changes: FileChange[] = []
 
   private listeners = new Set<(e: ServerEvent) => void>()
   private pendingPermissions = new Map<
@@ -123,13 +159,64 @@ export class Session {
   }
 
   private buildTools(env: ReturnType<typeof detectEnv>): Tool[] {
-    return createMainTools(this.ctx, {
-      provider: this.provider,
-      model: this.model,
-      subagentSystem: buildSubagentPrompt(env),
-      subagentTools: createSubagentTools(),
-      check: (t, i) => this.engine.check(t, i),
-      maxTurns: 30,
+    const subagentTools = this.wrapFileDiff(createSubagentTools(), true)
+    return this.wrapFileDiff(
+      createMainTools(this.ctx, {
+        provider: this.provider,
+        model: this.model,
+        subagentSystem: buildSubagentPrompt(env),
+        subagentTools,
+        check: (t, i) => this.engine.check(t, i),
+        maxTurns: 30,
+      }),
+      false,
+    )
+  }
+
+  /**
+   * Snapshot the file content before and after each Write/Edit and
+   * broadcast a `file_change` event, so the web UI can render a live diff.
+   * Paths resolve against process.cwd(), exactly like the tools do.
+   */
+  private wrapFileDiff(tools: Tool[], subagent: boolean): Tool[] {
+    return tools.map((t) => {
+      if (t.name !== "Write" && t.name !== "Edit") return t
+      return {
+        ...t,
+        execute: async (input: ToolInput, ctx: ToolContext): Promise<ToolResult> => {
+          const raw = String(input.file_path ?? "")
+          if (!raw) return t.execute(input, ctx)
+          const abs = isAbsolute(raw) ? raw : join(process.cwd(), raw)
+          let before: string | null = null
+          try {
+            before = await readFile(abs, "utf8")
+          } catch {
+            before = null // new file
+          }
+          const res = await t.execute(input, ctx)
+          if (!res.ok) return res
+          let after: string | null = null
+          try {
+            after = await readFile(abs, "utf8")
+          } catch {
+            after = null
+          }
+          if (after === null) return res
+          const d = lineDiff(before ?? "", after)
+          const change: FileChange = {
+            path: raw,
+            kind: t.name === "Edit" ? "edit" : "write",
+            additions: d.additions,
+            deletions: d.deletions,
+            diff: d.lines.slice(0, 300),
+            subagent,
+          }
+          this.changes.push(change)
+          if (this.changes.length > 20) this.changes.splice(0, this.changes.length - 20)
+          this.broadcast({ type: "file_change", ...change })
+          return res
+        },
+      }
     })
   }
 
@@ -191,6 +278,7 @@ export class Session {
 
   setMode(mode: PermissionMode): void {
     this.engine.mode = mode
+    this.persist?.()
     this.broadcast({ type: "mode_changed", mode })
   }
 
@@ -205,6 +293,7 @@ export class Session {
     const env = detectEnv(this.cwd)
     this.system = buildSystemPrompt(env, loadMemory(this.cwd), this.thinking !== "off")
     this.tools = this.buildTools(env)
+    this.persist?.()
   }
 
   state() {
@@ -221,9 +310,15 @@ export class Session {
       todos: this.ctx.todos,
       usage: this.usage,
       createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+      msgCount: this.history.length,
+      forkedFrom: this.forkedFrom,
       turns: this.history.filter(
         (m) => m.role === "user" && m.content.some((b) => b.type === "text"),
       ).length,
+      // File changes of the current/last turn (last 8, diffs capped) so a
+      // (re)connecting client can re-render the change panel.
+      changes: this.changes.slice(-8),
       // Included in the SSE "session" snapshot so (re)connecting clients can
       // re-render an unanswered permission prompt.
       pendingPermission: pending.length
@@ -244,7 +339,8 @@ export class Session {
   transcript(): TranscriptEntry[] {
     const out: TranscriptEntry[] = []
     const filled = new Set<number>()
-    for (const m of this.history) {
+    for (let i = 0; i < this.history.length; i++) {
+      const m = this.history[i]
       if (m.role === "assistant") {
         // Preserve the order within the response: optional thinking first,
         // then text before the tool calls it introduces, then trailing text.
@@ -260,34 +356,45 @@ export class Session {
             thought += b.text
           } else if (b.type === "tool_use") {
             if (thought) {
-              out.push({ role: "thinking", text: thought })
+              out.push({ role: "thinking", text: thought, msgIndex: i })
               thought = ""
             }
             if (pre) {
-              out.push({ role: "assistant", text: pre })
+              out.push({ role: "assistant", text: pre, msgIndex: i })
               pre = ""
             }
             toolCount++
-            out.push({ role: "tool", name: b.name, args: b.input ?? {}, ok: false, output: "" })
+            out.push({ role: "tool", name: b.name, args: b.input ?? {}, ok: false, output: "", msgIndex: i })
           }
         }
-        if (thought) out.push({ role: "thinking", text: thought })
-        if (pre) out.push({ role: "assistant", text: pre })
-        if (post) out.push({ role: "assistant", text: post })
+        if (thought) out.push({ role: "thinking", text: thought, msgIndex: i })
+        if (pre) out.push({ role: "assistant", text: pre, msgIndex: i })
+        if (post) out.push({ role: "assistant", text: post, msgIndex: i })
       } else {
+        let text = ""
+        const images: { mediaType: string; data: string }[] = []
         for (const b of m.content) {
-          if (b.type === "text") out.push({ role: "user", text: b.text })
+          if (b.type === "text") text += (text ? "\n\n" : "") + b.text
+          else if (b.type === "image") images.push({ mediaType: b.mediaType, data: b.data })
           else if (b.type === "tool_result") {
-            for (let i = out.length - 1; i >= 0; i--) {
-              const e = out[i]
-              if (e.role === "tool" && !filled.has(i)) {
+            for (let k = out.length - 1; k >= 0; k--) {
+              const e = out[k]
+              if (e.role === "tool" && !filled.has(k)) {
                 e.ok = !b.is_error
                 e.output = b.content
-                filled.add(i)
+                filled.add(k)
                 break
               }
             }
           }
+        }
+        if (text || images.length) {
+          out.push({
+            role: "user",
+            text,
+            msgIndex: i,
+            ...(images.length ? { images } : {}),
+          })
         }
       }
     }
@@ -313,12 +420,18 @@ export class Session {
     return out
   }
 
-  async send(text: string): Promise<void> {
+  async send(text: string, images: { mediaType: string; data: string }[] = []): Promise<void> {
     if (this.busy) throw new Error("session is busy with another turn")
     this.busy = true
-    this.history.push({ role: "user", content: [{ type: "text", text }] })
+    this.changes = []
+    const content: ContentBlock[] = [{ type: "text", text }]
+    for (const img of images.slice(0, 8)) {
+      content.push({ type: "image", mediaType: img.mediaType, data: img.data })
+    }
+    this.history.push({ role: "user", content })
     const ac = new AbortController()
     this.abortController = ac
+    const turnUsage = { input: 0, output: 0 }
     try {
       const result = await runAgent(
         {
@@ -342,6 +455,12 @@ export class Session {
                 this.broadcast({ type: "todos", todos: this.ctx.todos })
               }
             }
+            if (e.type === "assistant_text") {
+              // The assistant message of this response is the last one in
+              // the history — the web UI uses the index as a fork point.
+              this.broadcast({ ...e, msgIndex: this.history.length - 1 })
+              return
+            }
             this.broadcast({ ...e })
           },
         },
@@ -349,11 +468,20 @@ export class Session {
       )
       this.usage.input += result.usage.input
       this.usage.output += result.usage.output
+      turnUsage.input += result.usage.input
+      turnUsage.output += result.usage.output
     } finally {
       this.busy = false
       this.abortController = null
       this.completedTools = []
-      this.broadcast({ type: "turn_end" })
+      this.updatedAt = Date.now()
+      this.broadcast({
+        type: "turn_end",
+        usage: turnUsage,
+        changes: this.changes,
+        msgCount: this.history.length,
+      })
+      this.persist?.()
     }
   }
 }
@@ -364,6 +492,7 @@ export class AnvilServer {
   private webRoot: string
   private config: ServerConfig
   private settings: ResolvedSettings | null
+  private diskCache: { at: number; items: SessionMeta[] } | null = null
 
   constructor(config: ServerConfig, settings?: ResolvedSettings) {
     this.config = config
@@ -376,6 +505,56 @@ export class AnvilServer {
     }
     const here = dirname(fileURLToPath(import.meta.url))
     this.webRoot = normalize(join(here, "..", "web"))
+  }
+
+  /** Wire the on-disk store to a session (save after create/turn/mode/fork). */
+  private attachPersistence(s: Session): void {
+    s.persist = () => {
+      s.updatedAt = Date.now()
+      void saveSession({
+        id: s.id,
+        title: s.title,
+        kind: s.kind,
+        model: s.model,
+        thinking: s.thinking,
+        mode: s.engine.mode,
+        cwd: s.cwd,
+        createdAt: s.createdAt,
+        updatedAt: s.updatedAt,
+        usage: { ...s.usage },
+        forkedFrom: s.forkedFrom,
+        history: s.history,
+        todos: s.ctx.todos,
+      }).catch(() => {})
+    }
+  }
+
+  /** Persisted sessions from disk (2s cache — the UI polls every 4s). */
+  private async cachedDiskSessions(): Promise<SessionMeta[]> {
+    const now = Date.now()
+    if (this.diskCache && now - this.diskCache.at < 2000) return this.diskCache.items
+    const items = await listSessions().catch(() => [])
+    this.diskCache = { at: now, items }
+    return items
+  }
+
+  /** Bring a persisted session back into memory (server restart, other tab). */
+  private async adoptStored(id: string): Promise<Session | null> {
+    const stored = await loadSession(id).catch(() => null)
+    if (!stored) return null
+    const session = new Session(stored.id, this.config, stored.mode, {
+      model: stored.model,
+      thinking: stored.thinking,
+    })
+    session.history = stored.history
+    session.ctx = { cwd: stored.cwd, todos: stored.todos }
+    session.usage = stored.usage
+    session.createdAt = stored.createdAt
+    session.updatedAt = stored.updatedAt
+    session.forkedFrom = stored.forkedFrom
+    this.sessions.set(stored.id, session)
+    this.attachPersistence(session)
+    return session
   }
 
   private configView(): ConfigView {
@@ -407,7 +586,10 @@ export class AnvilServer {
   async listen(port = 8787): Promise<number> {
     const http = createServer((req, res) => {
       this.handle(req, res).catch((err) => {
-        if (!res.headersSent) json(res, 500, { error: String(err) })
+        if (!res.headersSent) {
+          const msg = String(err)
+          json(res, msg.includes("body too large") ? 413 : 500, { error: msg })
+        }
       })
     })
     await new Promise<void>((resolve, reject) => {
@@ -513,6 +695,8 @@ export class AnvilServer {
         const modelReq = typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined
         const session = new Session(id, this.config, mode, { model: modelReq, thinking })
         this.sessions.set(id, session)
+        this.attachPersistence(session)
+        session.persist?.()
         return json(res, 201, {
           id,
           cwd: this.config.cwd,
@@ -523,28 +707,65 @@ export class AnvilServer {
       }
 
       if (method === "GET" && path === "/api/sessions") {
-        const sessions = [...this.sessions.values()]
-          .sort((a, b) => b.createdAt - a.createdAt)
-          .map((s) => {
-            const st = s.state()
-            return {
-              id: s.id,
-              title: st.title,
-              mode: st.mode,
-              busy: st.busy,
-              turns: st.turns,
-              createdAt: s.createdAt,
-              needsPermission: st.pendingPermission !== null,
-            }
+        const disk = await this.cachedDiskSessions()
+        interface Row {
+          id: string
+          title: string
+          model: string
+          mode: string
+          cwd: string
+          busy: boolean
+          turns: number
+          createdAt: number
+          updatedAt: number
+          [k: string]: unknown
+        }
+        const byId = new Map<string, Row>()
+        for (const m of disk) {
+          byId.set(m.id, {
+            id: m.id,
+            title: m.title,
+            model: m.model,
+            mode: m.mode,
+            cwd: m.cwd,
+            busy: false,
+            turns: m.turns,
+            createdAt: m.createdAt,
+            updatedAt: m.updatedAt,
+            thinking: m.thinking,
+            usage: m.usage,
+            forkedFrom: m.forkedFrom,
+            needsPermission: false,
           })
+        }
+        for (const s of this.sessions.values()) {
+          const st = s.state()
+          byId.set(s.id, {
+            id: s.id,
+            title: st.title,
+            model: s.model,
+            mode: st.mode,
+            cwd: s.cwd,
+            busy: st.busy,
+            turns: st.turns,
+            createdAt: s.createdAt,
+            updatedAt: s.updatedAt,
+            thinking: s.thinking,
+            usage: s.usage,
+            forkedFrom: s.forkedFrom,
+            needsPermission: st.pendingPermission !== null,
+          })
+        }
+        const sessions = [...byId.values()].sort((a, b) => b.updatedAt - a.updatedAt)
         return json(res, 200, { sessions })
       }
 
       const m = path.match(
-        /^\/api\/sessions\/([^/]+)(?:\/(messages|events|permissions|mode|transcript|abort))?$/,
+        /^\/api\/sessions\/([^/]+)(?:\/(messages|events|permissions|mode|transcript|abort|fork))?$/,
       )
       if (m) {
-        const session = this.sessions.get(m[1])
+        let session = this.sessions.get(m[1])
+        if (!session) session = await this.adoptStored(m[1])
         if (!session) return json(res, 404, { error: "unknown session" })
         const sub = m[2]
 
@@ -553,6 +774,9 @@ export class AnvilServer {
         if (method === "DELETE" && !sub) {
           session.abort()
           this.sessions.delete(m[1])
+          // Awaiting matters: a concurrent GET must not be able to re-adopt
+          // the session from a file that is still on disk.
+          await deleteSessionFile(m[1])
           return json(res, 200, { ok: true })
         }
 
@@ -586,14 +810,61 @@ export class AnvilServer {
         if (method === "GET" && sub === "events") return this.handleEvents(req, res, session)
 
         if (method === "POST" && sub === "messages") {
-          const body = await readJson(req)
+          const body = await readJson(req, 15_000_000)
           const text = typeof body?.text === "string" ? body.text : ""
-          if (!text) return json(res, 400, { error: "text is required" })
+          const images: { mediaType: string; data: string }[] = []
+          if (Array.isArray(body?.images)) {
+            for (const im of body.images as unknown[]) {
+              const o = im as { mediaType?: unknown; data?: unknown } | null
+              if (
+                o &&
+                typeof o.mediaType === "string" &&
+                o.mediaType.startsWith("image/") &&
+                typeof o.data === "string"
+              ) {
+                images.push({ mediaType: o.mediaType, data: o.data })
+              }
+            }
+          }
+          if (!text && images.length === 0) return json(res, 400, { error: "text and/or images are required" })
           if (session.busy) return json(res, 409, { error: "session is busy with another turn" })
-          session.send(text).catch((err) => {
+          session.send(text, images).catch((err) => {
             session.broadcast({ type: "error", text: String(err) })
           })
           return json(res, 202, { started: true })
+        }
+
+        if (method === "POST" && sub === "fork") {
+          if (session.busy) return json(res, 409, { error: "wait for the turn to finish before forking" })
+          if (session.history.length === 0) return json(res, 400, { error: "nothing to fork yet" })
+          const body = (await readJson(req)) ?? {}
+          const reqIdx =
+            typeof body.msgIndex === "number" && Number.isFinite(body.msgIndex)
+              ? Math.floor(body.msgIndex as number)
+              : session.history.length - 1
+          // A fork point must end on a complete message: never inside a
+          // tool_use/tool_result pair (the next API call would be invalid).
+          const validEnd = (j: number): boolean => {
+            const mm = session.history[j]
+            if (!mm) return false
+            if (mm.role === "user") return true
+            return !mm.content.some((b) => b.type === "tool_use")
+          }
+          let cut = Math.max(0, Math.min(reqIdx, session.history.length - 1))
+          while (cut > 0 && !validEnd(cut)) cut--
+          if (!validEnd(cut)) return json(res, 400, { error: "no valid fork point at this position" })
+          const fork = new Session(randomUUID(), this.config, session.engine.mode, {
+            model: session.model,
+            thinking: session.thinking,
+          })
+          fork.history = structuredClone(session.history.slice(0, cut + 1))
+          fork.ctx.todos = structuredClone(session.ctx.todos)
+          fork.usage = { ...session.usage }
+          fork.forkedFrom = { id: session.id, at: cut }
+          this.sessions.set(fork.id, fork)
+          this.attachPersistence(fork)
+          fork.persist?.()
+          return json(res, 201, { id: fork.id, title: fork.title, forkedFrom: fork.forkedFrom })
         }
 
         if (method === "POST" && sub === "permissions") {
@@ -669,12 +940,12 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(data)
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown> | null> {
+async function readJson(req: IncomingMessage, maxBytes = 1_000_000): Promise<Record<string, unknown> | null> {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req) {
     size += (chunk as Buffer).length
-    if (size > 1_000_000) throw new Error("body too large")
+    if (size > maxBytes) throw new Error("body too large")
     chunks.push(chunk as Buffer)
   }
   if (chunks.length === 0) return null
