@@ -12,7 +12,7 @@ import { PermissionEngine, type AskAnswer, type AskFn, type PermissionMode } fro
 import { buildSubagentPrompt, buildSystemPrompt, detectEnv } from "./prompt.ts"
 import { loadMemory } from "./memory.ts"
 import { createMainTools, createSubagentTools } from "./tools/index.ts"
-import type { Message, Provider, ToolContext, Tool } from "./types.ts"
+import type { Message, Provider, ToolContext, Tool, ToolInput } from "./types.ts"
 
 export const VERSION = "0.2.0"
 export const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
@@ -25,6 +25,11 @@ export interface ServerConfig {
 }
 
 export type ServerEvent = { type: string } & Record<string, unknown>
+
+export type TranscriptEntry =
+  | { role: "user"; text: string }
+  | { role: "assistant"; text: string }
+  | { role: "tool"; name: string; args: ToolInput; ok: boolean; output: string }
 
 /**
  * One web/CLI session: owns the conversation history, tool context and
@@ -42,7 +47,10 @@ export class Session {
   busy = false
 
   private listeners = new Set<(e: ServerEvent) => void>()
-  private pendingPermissions = new Map<string, { resolve: (a: AskAnswer) => void }>()
+  private pendingPermissions = new Map<
+    string,
+    { resolve: (a: AskAnswer) => void; toolName: string; detail: string }
+  >()
   private permissionCounter = 0
   private tools: Tool[]
   private provider: Provider
@@ -64,7 +72,7 @@ export class Session {
     const ask: AskFn = (toolName, _input, detail) =>
       new Promise<AskAnswer>((resolve) => {
         const permId = `perm-${++this.permissionCounter}`
-        this.pendingPermissions.set(permId, { resolve })
+        this.pendingPermissions.set(permId, { resolve, toolName, detail })
         this.broadcast({ type: "permission_request", id: permId, toolName, detail })
       })
     this.engine = new PermissionEngine(mode, ask, true)
@@ -110,6 +118,7 @@ export class Session {
   }
 
   state() {
+    const pending = [...this.pendingPermissions.entries()]
     return {
       id: this.id,
       cwd: this.cwd,
@@ -120,7 +129,49 @@ export class Session {
       turns: this.history.filter(
         (m) => m.role === "user" && m.content.some((b) => b.type === "text"),
       ).length,
+      // Included in the SSE "session" snapshot so (re)connecting clients can
+      // re-render an unanswered permission prompt.
+      pendingPermission: pending.length
+        ? { id: pending[0][0], toolName: pending[0][1].toolName, detail: pending[0][1].detail }
+        : null,
     }
+  }
+
+  /**
+   * Compact, renderable view of everything that happened so far — used by
+   * the web UI to replay a session after a page load.
+   */
+  transcript(): TranscriptEntry[] {
+    const out: TranscriptEntry[] = []
+    const filled = new Set<number>()
+    for (const m of this.history) {
+      if (m.role === "assistant") {
+        let text = ""
+        for (const b of m.content) {
+          if (b.type === "text") text += b.text
+          else if (b.type === "tool_use") {
+            out.push({ role: "tool", name: b.name, args: b.input ?? {}, ok: false, output: "" })
+          }
+        }
+        if (text) out.push({ role: "assistant", text })
+      } else {
+        for (const b of m.content) {
+          if (b.type === "text") out.push({ role: "user", text: b.text })
+          else if (b.type === "tool_result") {
+            for (let i = out.length - 1; i >= 0; i--) {
+              const e = out[i]
+              if (e.role === "tool" && !filled.has(i)) {
+                e.ok = !b.is_error
+                e.output = b.content
+                filled.add(i)
+                break
+              }
+            }
+          }
+        }
+      }
+    }
+    return out
   }
 
   async send(text: string): Promise<void> {
@@ -203,13 +254,19 @@ export class AnvilServer {
         return json(res, 201, { id, cwd: this.config.cwd, model: this.config.model, mode })
       }
 
-      const m = path.match(/^\/api\/sessions\/([^/]+)(?:\/(messages|events|permissions|mode))?$/)
+      const m = path.match(
+        /^\/api\/sessions\/([^/]+)(?:\/(messages|events|permissions|mode|transcript))?$/,
+      )
       if (m) {
         const session = this.sessions.get(m[1])
         if (!session) return json(res, 404, { error: "unknown session" })
         const sub = m[2]
 
         if (method === "GET" && !sub) return json(res, 200, session.state())
+
+        if (method === "GET" && sub === "transcript") {
+          return json(res, 200, { entries: session.transcript() })
+        }
 
         if (method === "GET" && sub === "events") return this.handleEvents(req, res, session)
 
