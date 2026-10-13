@@ -5,9 +5,10 @@
   "type": "module",
   "license": "MIT",
   "bin": {
-    "anvil": "./src/index.ts"
+    "anvil": "./bin/anvil.js"
   },
   "files": [
+    "bin",
     "src",
     "web",
     "scripts"

@@ -142,6 +142,8 @@ src/
     ├── todo.ts         todo list (exactly one in_progress at a time)
     ├── task.ts         subagent delegation (nested agent loop)
     └── index.ts        tool registry
+bin/
+└── anvil.js            npm launcher shim (npm rejects .ts bin entries)
 web/
 ├── index.html  styles.css  app.js   dependency-free UI (vanilla JS)
 scripts/
