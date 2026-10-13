@@ -463,7 +463,7 @@ async function main(): Promise<void> {
   check("fork of an empty session → 400", forkEmpty.status === 400)
 
   console.log("\n— persistence —")
-  const sessionsDir = join(dir, "anvil-sessions")
+  const sessionsDir = join(dir, ".anvil", "anvil-sessions")
   const sessionFile = join(sessionsDir, `${id}.json`)
   const diskRaw = await (async () => {
     for (let i = 0; i < 100; i++) {

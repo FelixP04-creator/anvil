@@ -3,7 +3,7 @@
 // keeps the test suite hermetic). Used by the web server (so sessions
 // survive restarts) and the CLI (`anvil -c`, `anvil -r <id>`, `anvil sessions`).
 
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 
 import { configPath } from "./config.ts"
@@ -44,12 +44,42 @@ export interface SessionMeta {
 }
 
 export function sessionsDir(): string {
-  return join(dirname(configPath()), "anvil-sessions")
+  // A hidden .anvil/ folder next to the config file — with the default
+  // config (~/.anvil.json) that is ~/.anvil/anvil-sessions/.
+  return join(dirname(configPath()), ".anvil", "anvil-sessions")
 }
 
 function fileFor(id: string): string {
   if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error(`invalid session id: ${id}`)
   return join(sessionsDir(), `${id}.json`)
+}
+
+/**
+ * v0.6.0 briefly stored sessions in <config dir>/anvil-sessions (a visible
+ * folder straight in the home dir). Move any stragglers into the new hidden
+ * location once; a no-op when nothing old exists.
+ */
+let legacyMigrated = false
+export async function migrateLegacySessions(): Promise<void> {
+  if (legacyMigrated) return
+  legacyMigrated = true
+  const legacy = join(dirname(configPath()), "anvil-sessions")
+  try {
+    const entries = await readdir(legacy)
+    if (entries.length === 0) {
+      await rm(legacy, { recursive: true, force: true })
+      return
+    }
+    const next = sessionsDir()
+    await mkdir(next, { recursive: true })
+    for (const name of entries) {
+      if (!name.endsWith(".json")) continue
+      await rename(join(legacy, name), join(next, name))
+    }
+    await rm(legacy, { recursive: true, force: true }).catch(() => {})
+  } catch {
+    // no legacy dir — nothing to migrate
+  }
 }
 
 export async function saveSession(s: StoredSession): Promise<void> {

@@ -14,6 +14,7 @@ import {
   deleteSessionFile,
   listSessions,
   loadSession,
+  migrateLegacySessions,
   saveSession,
   type SessionMeta,
 } from "./store.ts"
@@ -584,6 +585,7 @@ export class AnvilServer {
 
   /** Start listening; returns the actual port (pass 0 for an ephemeral one). */
   async listen(port = 8787): Promise<number> {
+    await migrateLegacySessions()
     const http = createServer((req, res) => {
       this.handle(req, res).catch((err) => {
         if (!res.headersSent) {

@@ -20,7 +20,7 @@ import { loadMemory } from "./memory.ts"
 import { createMainTools, createSubagentTools } from "./tools/index.ts"
 import { startRepl } from "./repl.ts"
 import { AnvilServer } from "./server.ts"
-import { listSessions, loadSession, saveSession, type StoredSession } from "./store.ts"
+import { listSessions, loadSession, migrateLegacySessions, saveSession, type StoredSession } from "./store.ts"
 import type { Message, ThinkingEffort, ToolContext } from "./types.ts"
 
 const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
@@ -248,6 +248,10 @@ async function main(): Promise<void> {
     console.error(`error: unknown thinking level "${args.thinking}" (use: ${THINKING_LEVELS.join(", ")})`)
     process.exit(1)
   }
+
+  // One-time move of sessions stored by early v0.6.0 in the visible
+  // <config dir>/anvil-sessions folder into the hidden .anvil/ location.
+  await migrateLegacySessions()
 
   if (args.command === "config") {
     runConfigCommand(args.configArgs)
