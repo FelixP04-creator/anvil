@@ -25,7 +25,7 @@ import {
 import type { ProviderKind } from "./providers/index.ts"
 import type { Message, Provider, ThinkingEffort, ToolContext, Tool, ToolInput } from "./types.ts"
 
-export const VERSION = "0.5.2"
+export const VERSION = "0.5.3"
 export const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"]
 export const THINKING: ThinkingEffort[] = THINKING_LEVELS
 

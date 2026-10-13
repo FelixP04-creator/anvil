@@ -5,8 +5,13 @@
 // Robustness:
 // - transient provider errors (rate limits, overloads, network blips) are
 //   retried with backoff, but only while nothing has been streamed yet;
+// - a model that emits tool-call arguments that are not valid JSON is
+//   retried (a generation glitch) even after partial output — no answer
+//   has been committed yet;
 // - a response cut off by the token limit is continued automatically
-//   (up to a few times) instead of being handed back truncated;
+//   (up to a few times) instead of being handed back truncated — this also
+//   covers a truncation inside a tool call, which the provider reports as
+//   max_tokens with no tool use;
 // - extended-thinking blocks are streamed as their own events and kept in
 //   the history, as the APIs require.
 
@@ -75,8 +80,15 @@ function isRetryableError(err: unknown): boolean {
   if (/abort/i.test(msg)) return false
   return (
     /API error (429|500|502|503|529)\b/.test(msg) ||
-    /fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/i.test(msg)
+    /fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/i.test(msg) ||
+    isMalformedToolJson(err)
   )
+}
+
+/** The model emitted tool-call arguments that are not valid JSON — a
+ *  generation glitch worth a fresh attempt, even after partial output. */
+function isMalformedToolJson(err: unknown): boolean {
+  return /malformed tool call json/i.test(String(err))
 }
 
 export async function runAgent(opts: AgentOptions, messages: Message[]): Promise<AgentResult> {
@@ -138,9 +150,16 @@ export async function runAgent(opts: AgentOptions, messages: Message[]): Promise
 
     // --- done? --------------------------------------------------------------
     if (resp.toolUse.length === 0) {
-      // The model ran out of tokens mid-answer: nudge it to continue rather
-      // than returning a truncated reply.
-      if (resp.stop === "max_tokens" && resp.text && continuations < MAX_CONTINUATIONS) {
+      // The model ran out of tokens: either mid-answer or inside a tool
+      // call (the provider reports the latter as max_tokens with empty
+      // toolUse). Nudge it to continue rather than giving up.
+      if (resp.stop === "max_tokens" && continuations < MAX_CONTINUATIONS) {
+        // The nudge is a user message: it must not follow another user
+        // message directly (the Anthropic API requires alternation). If
+        // nothing was appended to the history above, bail out instead.
+        if (blocks.length === 0) {
+          return { text: "(the model produced no output)", turns: turn, usage }
+        }
         continuations++
         messages.push({ role: "user", content: [{ type: "text", text: CONTINUATION_NUDGE }] })
         continue
@@ -236,7 +255,11 @@ async function completeWithRetry(
       )
     } catch (err) {
       if (opts.signal?.aborted) throw err
-      if (attempt >= MAX_ATTEMPTS || gotOutput || !isRetryableError(err)) throw err
+      if (attempt >= MAX_ATTEMPTS || !isRetryableError(err)) throw err
+      // Normally no retry after output was streamed (the UI would show the
+      // answer twice) — but a malformed tool call has no committed answer
+      // yet, so a fresh attempt is safe.
+      if (gotOutput && !isMalformedToolJson(err)) throw err
       const delay = retryDelay(attempt, opts.retryBaseDelayMs ?? 1500)
       opts.onEvent?.({
         type: "retry",

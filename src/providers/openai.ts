@@ -25,6 +25,15 @@ function isReasoningModel(model: string): boolean {
   return /^o\d/.test(m) || m.startsWith("gpt-5")
 }
 
+/** Thinking budgets for reasoning models, mirroring the Anthropic provider.
+ *  The completion budget must cover the budget plus margin for the actual
+ *  answer/tool call, or long thinking blocks truncate the output mid-JSON. */
+const THINKING_BUDGETS: Record<Exclude<ThinkingEffort, "off">, number> = {
+  low: 4096,
+  medium: 16384,
+  high: 32768,
+}
+
 /** Map anvil's effort to the API value; "off" → no override. o1 caps at
  *  medium. Non-reasoning models → undefined (parameter omitted), unless the
  *  gateway forces reasoning on all models. */
@@ -96,11 +105,20 @@ export class OpenAIProvider implements Provider {
     onThinking?: (text: string) => void,
   ): Promise<ProviderResponse> {
     const reasoning = this.forceReasoning || isReasoningModel(req.model)
+    const effort = reasoningEffortFor(req.model, req.thinking ?? "off", this.forceReasoning)
+    // Reasoning tokens count against the completion budget. Reserve
+    // thinking budget + margin, otherwise a long thinking block starves the
+    // real answer/tool call and truncates it mid-JSON (seen on the hsnr
+    // gateway: "Unterminated string in JSON" inside a Write tool call).
+    const maxTokens = effort
+      ? Math.max(req.maxTokens, THINKING_BUDGETS[effort] + 4096)
+      : req.maxTokens
     const body: Record<string, unknown> = {
       model: req.model,
       stream: true,
-      // gpt-5/o-series use max_completion_tokens; older models use max_tokens.
-      ...(reasoning ? { max_completion_tokens: req.maxTokens } : { max_tokens: req.maxTokens }),
+      // gpt-5/o-series (and forced-reasoning gateways) use
+      // max_completion_tokens; older models use max_tokens.
+      ...(reasoning ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
       messages: [
         { role: "system", content: req.system },
         ...toOpenAIMessages(req.messages),
@@ -110,7 +128,6 @@ export class OpenAIProvider implements Provider {
         function: { name: t.name, description: t.description, parameters: t.inputSchema },
       })),
     }
-    const effort = reasoningEffortFor(req.model, req.thinking ?? "off", this.forceReasoning)
     if (effort) body.reasoning_effort = effort
 
     const conn = connectSignal(signal, CONNECT_TIMEOUT_MS)
@@ -207,13 +224,37 @@ export class OpenAIProvider implements Provider {
       }
     }
 
-    const toolUse = [...toolCalls.entries()]
-      .sort((a, b) => a[0] - b[0])
-      .map(([i, tc]) => ({
-        id: tc.id || `call_${i}`,
-        name: tc.name,
-        input: (JSON.parse(tc.args || "{}") ?? {}) as ToolInput,
-      }))
+    // Parse tool-call arguments defensively: under token pressure (or plain
+    // generation glitches) models occasionally emit truncated or invalid
+    // JSON. A raw SyntaxError here would kill the whole turn.
+    const toolUse: { id: string; name: string; input: ToolInput }[] = []
+    let truncatedToolCall = false
+    for (const [i, tc] of [...toolCalls.entries()].sort((a, b) => a[0] - b[0])) {
+      let input: ToolInput
+      try {
+        input = (JSON.parse(tc.args || "{}") ?? {}) as ToolInput
+      } catch (err) {
+        if (finishReason === "length") {
+          // The token limit was hit inside the arguments: report the whole
+          // response as truncated so the agent loop can continue it.
+          truncatedToolCall = true
+          break
+        }
+        throw new Error(
+          `Malformed tool call JSON from model (${tc.name || `tool ${i + 1}`}): ${String(err).slice(0, 120)} — raw arguments: ${tc.args.slice(0, 200)}`,
+        )
+      }
+      toolUse.push({ id: tc.id || `call_${i}`, name: tc.name, input })
+    }
+
+    if (truncatedToolCall) {
+      return {
+        text,
+        thinking: thought || undefined,
+        toolUse: [],
+        stop: "max_tokens",
+      }
+    }
 
     return {
       text,

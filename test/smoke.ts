@@ -9,6 +9,8 @@ import { PermissionEngine } from "../src/permissions.ts"
 import { buildSystemPrompt, detectEnv } from "../src/prompt.ts"
 import { loadMemory } from "../src/memory.ts"
 import { createMainTools, createSubagentTools } from "../src/tools/index.ts"
+import { OpenAIProvider } from "../src/providers/openai.ts"
+import { createServer } from "node:http"
 import type { Message, Provider, ProviderRequest, ProviderResponse, Tool, ToolContext, ToolInput } from "../src/types.ts"
 
 let failures = 0
@@ -210,6 +212,171 @@ async function main(): Promise<void> {
   check("recovered after transient failures", rResult.text.includes("recovered"))
   check("provider attempted 3 times", flaky.calls === 3, `calls=${flaky.calls}`)
   check("retry events emitted", rEvents.filter((e) => e.type === "retry").length === 2)
+
+  console.log("\n— truncated & malformed tool calls —")
+  // Provider reports a truncation inside a tool call as max_tokens with no
+  // tool use: the agent nudges and the model gets another shot.
+  const truncProvider = new MockProvider([
+    { text: "", thinking: "long thinking that ate the budget", toolUse: [], stop: "max_tokens" },
+    { text: "", toolUse: [tu("u1", "Glob", { pattern: "**/*" })], stop: "tool_use" },
+    { text: "Recovered after truncation.", toolUse: [], stop: "end_turn" },
+  ])
+  const truncHistory: Message[] = [{ role: "user", content: [{ type: "text", text: "list the files" }] }]
+  const truncResult = await runAgent({ ...opts, provider: truncProvider, onEvent: () => {} }, truncHistory)
+  check("truncated tool call gets a continuation (3 completions)", truncProvider.calls === 3, `calls=${truncProvider.calls}`)
+  check("truncation recovered", truncResult.text.includes("Recovered after truncation"), truncResult.text)
+  check(
+    "nudge appended after truncated tool call",
+    truncHistory.some(
+      (m) => m.role === "user" && m.content.some((b) => b.type === "text" && b.text.includes("Continue exactly where")),
+    ),
+  )
+
+  // Malformed tool-call JSON after streamed output: retried despite output.
+  class MalformedToolJsonProvider implements Provider {
+    name = "malformed"
+    calls = 0
+    async complete(_req: ProviderRequest, onDelta: (t: string) => void): Promise<ProviderResponse> {
+      this.calls++
+      onDelta("partial output")
+      if (this.calls === 1) {
+        throw new Error('Malformed tool call JSON from model (Write): Unterminated string in JSON — raw arguments: {"file_path":')
+      }
+      return { text: "recovered from malformed tool json", toolUse: [], stop: "end_turn" }
+    }
+  }
+  const malformed = new MalformedToolJsonProvider()
+  const mEvents: AgentEvent[] = []
+  const mHistory: Message[] = [{ role: "user", content: [{ type: "text", text: "write a file" }] }]
+  const mResult = await runAgent(
+    { ...opts, provider: malformed, retryBaseDelayMs: 10, onEvent: (e) => mEvents.push(e) },
+    mHistory,
+  )
+  check("malformed tool json retried despite streamed output", malformed.calls === 2, `calls=${malformed.calls}`)
+  check("malformed tool json recovered", mResult.text.includes("recovered from malformed"), mResult.text)
+  check("malformed tool json retry event emitted", mEvents.some((e) => e.type === "retry"))
+
+  console.log("\n— openai provider (fake SSE endpoint) —")
+  let capturedBody: Record<string, unknown> = {}
+  let nextSse = ""
+  const sse = (lines: string[]) => lines.map((l) => `data: ${l}\n\n`).join("")
+  // Tool-call SSE deltas built with JSON.stringify so the nested argument
+  // escaping can't go wrong (hand-escaped strings are a trap).
+  function tc(args: string, finish: string | null, name?: string): string {
+    const fn: Record<string, unknown> = { arguments: args }
+    if (name) fn.name = name
+    return JSON.stringify({
+      choices: [
+        {
+          delta: { tool_calls: [{ index: 0, id: "c1", function: fn }] },
+          finish_reason: finish,
+        },
+      ],
+    })
+  }
+  const sseServer = createServer((req, res) => {
+    let data = ""
+    req.on("data", (c) => (data += c))
+    req.on("end", () => {
+      capturedBody = JSON.parse(data)
+      res.writeHead(200, { "content-type": "text/event-stream", connection: "close" })
+      res.write(nextSse)
+      res.end()
+    })
+  })
+  await new Promise<void>((r) => sseServer.listen(0, "127.0.0.1", r))
+  const ssePort = (sseServer.address() as { port: number }).port
+  const oa = new OpenAIProvider("test-key", `http://127.0.0.1:${ssePort}/openai`, true)
+  const oaReq: ProviderRequest = {
+    model: "Qwen/Qwen3.8-27B",
+    system: "sys",
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    tools: [],
+    maxTokens: 8000,
+  }
+
+  // thinking high must reserve a completion budget that survives the
+  // thinking block (budget + margin), or tool calls get truncated mid-JSON.
+  oaReq.thinking = "high"
+  nextSse = sse([
+    '{"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}',
+    '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+    "[DONE]",
+  ])
+  const oaHigh = await oa.complete(oaReq, () => {})
+  check(
+    "thinking high raises max_completion_tokens to budget+margin",
+    capturedBody.max_completion_tokens === 36864,
+    String(capturedBody.max_completion_tokens),
+  )
+  check("reasoning effort high sent", capturedBody.reasoning_effort === "high")
+  check("plain text answer parsed", oaHigh.text === "ok" && oaHigh.stop === "end_turn")
+
+  // thinking off keeps the base budget and sends no reasoning_effort
+  oaReq.thinking = "off"
+  nextSse = sse([
+    '{"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}',
+    '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+    "[DONE]",
+  ])
+  await oa.complete(oaReq, () => {})
+  check("thinking off keeps base max_completion_tokens", capturedBody.max_completion_tokens === 8000)
+  check("thinking off sends no reasoning_effort", !("reasoning_effort" in capturedBody))
+
+  // a tool call truncated by the token limit → max_tokens, no tool use
+  // (accumulated arguments: {"file_path": "a.txt",  — unterminated)
+  nextSse = sse([
+    tc('{"file_path": ', null, "Write"),
+    tc('"a.txt", ', null),
+    '{"choices":[{"delta":{},"finish_reason":"length"}]}',
+    "[DONE]",
+  ])
+  const oaTrunc = await oa.complete(oaReq, () => {})
+  check("truncated tool call reported as max_tokens", oaTrunc.stop === "max_tokens", oaTrunc.stop)
+  check("truncated tool call dropped", oaTrunc.toolUse.length === 0)
+
+  // invalid JSON without truncation → descriptive error (retryable upstream)
+  nextSse = sse([
+    tc('{"file_path": "a.txt", "content": "bad', "tool_calls", "Write"),
+    "[DONE]",
+  ])
+  let oaErr: unknown = null
+  try {
+    await oa.complete(oaReq, () => {})
+  } catch (err) {
+    oaErr = err
+  }
+  check(
+    "malformed tool json throws descriptive error",
+    oaErr !== null && /Malformed tool call JSON/.test(String(oaErr)),
+    String(oaErr),
+  )
+
+  // a valid tool call still parses
+  nextSse = sse([
+    tc('{"file_path": "a.txt"}', null, "Write"),
+    '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+    "[DONE]",
+  ])
+  const oaTool = await oa.complete(oaReq, () => {})
+  check(
+    "valid tool call parsed",
+    oaTool.toolUse.length === 1 &&
+      oaTool.toolUse[0].name === "Write" &&
+      (oaTool.toolUse[0].input as Record<string, unknown>).file_path === "a.txt",
+    JSON.stringify(oaTool.toolUse),
+  )
+  check("tool call stop reason", oaTool.stop === "tool_use")
+  // Close the server fully before the process exits: on Windows, exiting
+  // while the client's keep-alive socket is still closing trips a libuv
+  // assertion. "connection: close" (above) plus the drain below make the
+  // teardown deterministic.
+  await new Promise<void>((r, j) => {
+    sseServer.close((err) => (err ? j(err) : r()))
+    sseServer.closeAllConnections()
+  })
+  await new Promise((r) => setTimeout(r, 100))
+
 
   console.log("\n— permission modes —")
   const writeTool = tools.find((t) => t.name === "Write")!

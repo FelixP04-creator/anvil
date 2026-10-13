@@ -22,10 +22,11 @@ done — with a permission system that keeps you in control.
   turn limit is hit. Model text is streamed token by token (CLI and web).
 - **Robust loop** — transient provider errors (rate limits, overloads, network
   blips) are retried with exponential backoff, a reply cut off by the token
-  limit is continued automatically instead of being handed back truncated,
-  and provider calls are guarded by timeouts (connection, first token, and
-  stream idle), so a stalled model call surfaces an error instead of hanging
-  the session forever.
+  limit is continued automatically instead of being handed back truncated
+  (including a cutoff inside a tool call), and malformed tool-call JSON from
+  the model is retried instead of failing the turn. Provider calls are
+  guarded by timeouts (connection, first token, and stream idle), so a stalled
+  model call surfaces an error instead of hanging the session forever.
 - **Three providers** — Anthropic Messages API, any OpenAI-compatible
   endpoint (`OPENAI_BASE_URL`), and the HSNR gateway (`ai.ide3.de`, models
   `Qwen/Qwen3.8-27B`, `zai-org/GLM-5.3`, `ultrabrain`, `smallbrain`), selected
@@ -244,10 +245,13 @@ messages kept by the caller (REPL, web session, subagent). Each turn sends
 thinking deltas are forwarded as events. If the reply contains tool calls,
 each one goes through the permission engine, is executed, and the results are
 appended as `tool_result` blocks. The loop ends when the model replies with
-plain text or `maxTurns` is reached. Two robustness layers wrap each
-completion: transient API errors are retried with backoff (only while nothing
-has been streamed yet), and a `max_tokens` cutoff without tool calls triggers
-an automatic "continue where you stopped" round (a few at most).
+plain text or `maxTurns` is reached. Robustness wraps each completion:
+transient API errors are retried with backoff (only while nothing has been
+streamed yet); a `max_tokens` cutoff — mid-answer or inside a tool call,
+which the provider reports as a cutoff with no tool use — triggers an
+automatic "continue where you stopped" round (a few at most); and a model
+that emits tool-call arguments that are not valid JSON gets a fresh attempt
+even after partial output, since no answer has been committed yet.
 
 **Permissions** (`permissions.ts`): read-only tools never ask. In `default`
 mode every new tool — or, for Bash, every new two-word command prefix —
