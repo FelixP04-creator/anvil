@@ -2,3 +2,5 @@ node_modules/
 dist/
 .anvil/
 *.log
+
+package-lock.json
