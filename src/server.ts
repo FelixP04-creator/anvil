@@ -29,7 +29,7 @@ export type ServerEvent = { type: string } & Record<string, unknown>
 export type TranscriptEntry =
   | { role: "user"; text: string }
   | { role: "assistant"; text: string }
-  | { role: "tool"; name: string; args: ToolInput; ok: boolean; output: string }
+  | { role: "tool"; name: string; args: ToolInput; ok: boolean; output: string; pending?: boolean }
 
 /**
  * One web/CLI session: owns the conversation history, tool context and
@@ -170,6 +170,12 @@ export class Session {
           }
         }
       }
+    }
+    // Tool calls without a result yet are still running (or waiting at a
+    // permission prompt).
+    for (let i = 0; i < out.length; i++) {
+      const e = out[i]
+      if (e.role === "tool" && !filled.has(i)) e.pending = true
     }
     return out
   }

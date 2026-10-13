@@ -11,6 +11,10 @@ done — with a permission system that keeps you in control.
 > prompts, or assets from any other product, and is not affiliated with or
 > endorsed by Anthropic or OpenAI.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="anvil web UI: streamed answer, tool chips with output, and a permission prompt" width="900">
+</p>
+
 ## Features
 
 - **Agent loop with streaming** — the model proposes tool calls, anvil
@@ -59,7 +63,16 @@ node src/index.ts server --port 9000 --cwd /path/to/project
 Open the printed URL. The UI creates a session, streams the agent's answer
 token by token, shows every tool call with its output, and renders permission
 requests as cards (Allow once / Always allow / Deny). The permission mode can
-be switched live in the header.
+be switched live in the header. Sessions survive page reloads: the
+`?session=<id>` deep link reopens them, and the transcript is replayed from
+the server (including a permission prompt that is still pending).
+
+Try it without any API key — a scripted mock provider with a pre-seeded
+conversation (one finished turn, one turn waiting at a permission prompt):
+
+```sh
+node scripts/demo-server.ts        # prints a ready-made session URL
+```
 
 ### HTTP API (used by the UI, open to anything else)
 
@@ -67,7 +80,8 @@ be switched live in the header.
 | --- | --- | --- |
 | `GET` | `/api/health` | liveness + version |
 | `POST` | `/api/sessions` | create a session (`{ "mode": "default" }`) |
-| `GET` | `/api/sessions/:id` | state: mode, busy, todos, turns |
+| `GET` | `/api/sessions/:id` | state: mode, busy, todos, turns, pending permission |
+| `GET` | `/api/sessions/:id/transcript` | renderable replay of everything that happened |
 | `POST` | `/api/sessions/:id/messages` | `{ "text": "…" }` → starts a turn (202) |
 | `GET` | `/api/sessions/:id/events` | SSE stream of agent events |
 | `POST` | `/api/sessions/:id/permissions` | `{ "id": "perm-1", "answer": "once" }` |
@@ -111,6 +125,8 @@ src/
     └── index.ts        tool registry
 web/
 ├── index.html  styles.css  app.js   dependency-free UI (vanilla JS)
+scripts/
+└── demo-server.ts              web UI demo, no API key needed
 test/
 ├── smoke.ts            agent loop, tools, permissions (mock provider)
 └── server-smoke.ts     HTTP server: sessions, SSE, permission round-trip

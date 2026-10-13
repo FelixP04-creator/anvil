@@ -176,9 +176,11 @@ function renderTranscript(entries) {
     if (e.role === "user") appendUser(e.text)
     else if (e.role === "assistant") appendAssistant(e.text)
     else if (e.role === "tool") {
-      append(
-        buildTool(e.name, formatInput(e.name, e.args), e.ok ? "ok" : "error", e.ok ? "ok" : "err", e.output),
-      )
+      if (e.pending) append(buildTool(e.name, formatInput(e.name, e.args), "…", ""))
+      else
+        append(
+          buildTool(e.name, formatInput(e.name, e.args), e.ok ? "ok" : "error", e.ok ? "ok" : "err", e.output),
+        )
     }
   }
 }
@@ -307,15 +309,19 @@ async function init() {
   $("cwd").textContent = s.cwd
   $("empty-cwd").textContent = s.cwd
   $("mode").value = s.mode
-  connect()
   wireComposer()
   if (s.busy) setBusy(true)
-  // Replay the conversation that happened before this page load.
+  // Replay the conversation from before this page load — first the transcript,
+  // then any pending permission prompt — so the visual order is preserved.
+  // (The SSE "session" snapshot may re-send the permission; renderedPerms
+  // keeps it from rendering twice.)
   const t = await fetch(`/api/sessions/${sessionId}/transcript`)
   if (t.ok) {
     const data = await t.json()
     renderTranscript(data.entries ?? [])
   }
+  if (s.pendingPermission) onPermission(s.pendingPermission)
+  connect()
   $("input").focus()
 }
 
