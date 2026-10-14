@@ -50,6 +50,20 @@ jobs:
           name: anvil-mobile-android
           path: mobile/android/app/build/outputs/apk/debug/anvil-mobile-*.apk
 
+      - name: Ensure release exists
+        if: startsWith(github.ref_name, 'v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Re-pushing a tag deletes the old release along with the tag,
+          # so (re)create it when it is missing before attaching assets.
+          if ! gh release view "${GITHUB_REF_NAME}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${{ github.repository }}" \
+              --title "anvil ${GITHUB_REF_NAME}" \
+              --notes "Built from source — see the README. Assets: Windows EXE (uploaded from a Windows build), Android APK, and the unsigned iOS IPA (sideload with AltStore / SideSync)."
+          fi
+
       - name: Attach APK to the release
         if: startsWith(github.ref_name, 'v')
         env:
@@ -101,6 +115,18 @@ jobs:
         with:
           name: anvil-mobile-ios
           path: mobile/ios/build/unsigned/*.ipa
+
+      - name: Ensure release exists
+        if: startsWith(github.ref_name, 'v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${{ github.repository }}" \
+              --title "anvil ${GITHUB_REF_NAME}" \
+              --notes "Built from source — see the README. Assets: Windows EXE (uploaded from a Windows build), Android APK, and the unsigned iOS IPA (sideload with AltStore / SideSync)."
+          fi
 
       - name: Attach IPA to the release
         if: startsWith(github.ref_name, 'v')
