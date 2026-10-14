@@ -274,9 +274,11 @@ The releases page ships `anvil-win-x64.exe` — a single self-contained binary
 no Node install, no web folder, the UI is served from memory.
 
 ```sh
-anvil-win-x64.exe server        # binds 0.0.0.0 by default (LAN-reachable)
-                                # and opens the browser
+anvil-win-x64.exe               # double-click: start the web server and
+                                # open the web UI in your browser (binds
+                                # 0.0.0.0 by default, so phones can connect)
 anvil-win-x64.exe "fix the bug" # one-shot CLI, like the npm version
+anvil-win-x64.exe server --port 9000 --no-browser
 ```
 
 Build it yourself (Node ≥ 23.6, Windows):

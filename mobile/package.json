@@ -1,6 +1,6 @@
 {
   "name": "anvil-mobile",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "private": true,
   "description": "anvil mobile app — Capacitor shell around the anvil server UI (remote) and the offline WebGPU model (local)",
   "scripts": {

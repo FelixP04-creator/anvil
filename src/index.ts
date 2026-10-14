@@ -239,15 +239,18 @@ function isEmbedded(): boolean {
   return Boolean((globalThis as { __ANVIL_EMBEDDED__?: boolean }).__ANVIL_EMBEDDED__)
 }
 
-/** First non-internal IPv4 address of this machine (for the "phone connects here" hint). */
-function lanIP(): string | null {
+/** All non-internal IPv4 addresses (for the "phone connects here" hint). */
+function lanIPs(): string[] {
+  const out: string[] = []
   const ifaces = networkInterfaces()
   for (const list of Object.values(ifaces)) {
     for (const n of list ?? []) {
-      if (n.family === "IPv4" && !n.internal) return n.address
+      if (n.family === "IPv4" && !n.internal && !n.address.startsWith("169.254.")) {
+        out.push(n.address)
+      }
     }
   }
-  return null
+  return [...new Set(out)]
 }
 
 /** Open the system browser; fire-and-forget (never throws). */
@@ -320,8 +323,14 @@ async function main(): Promise<void> {
     return
   }
 
-  // The single-file exe (SEA bundle) is a "desktop app": bind to the LAN
-  // by default so phones/tablets can connect, and open the browser.
+  // The single-file exe (SEA bundle) is a "desktop app". Double-clicking
+  // it (no arguments at all) starts the server and opens the web UI
+  // instead of the terminal REPL.
+  if (isEmbedded() && args.command === "run" && !args.task && !args.cont && !args.resume) {
+    args.command = "server"
+  }
+  // ... and when serving: bind to the LAN by default so phones/tablets
+  // can connect.
   if (isEmbedded() && args.command === "server" && !args.hostExplicit) {
     args.host = "0.0.0.0"
   }
@@ -347,18 +356,26 @@ async function main(): Promise<void> {
       s,
     )
     const port = await server.listen(args.port, args.host)
-    const url = `http://${args.host === "0.0.0.0" ? lanIP() || "localhost" : args.host}:${port}`
-    console.log(`anvil server listening on ${args.host === "0.0.0.0" ? `http://${lanIP() || "localhost"}:${port} (all interfaces)` : url}`)
-    console.log(`  web UI:  ${url}`)
+    const lan = lanIPs()
+    const listenUrl =
+      args.host === "0.0.0.0"
+        ? `http://${lan[0] ?? "localhost"}:${port} (all interfaces)`
+        : `http://${args.host}:${port}`
+    console.log(`anvil server listening on ${listenUrl}`)
+    console.log(`  web UI:  http://localhost:${port}`)
     if (args.host === "0.0.0.0") {
-      console.log(`  phones:  connect from your phone to ${url} (same network)`)
+      for (const ip of lan) {
+        console.log(`  phones:  connect from your phone to http://${ip}:${port} (same network)`)
+      }
     }
     if (s) console.log(`  model:   ${s.model} (${s.kind}, thinking: ${s.thinking})`)
     else console.log(`  model:   (none yet — configure a provider in the web UI or with anvil config set)`)
     console.log(`  cwd:     ${args.cwd}`)
     console.log(`  keys:    config file ${configPath()} or environment variables`)
     if (!args.noBrowser) {
-      openBrowser(url)
+      // Always open the local URL — the viewer is on this machine; the LAN
+      // address is printed above for phones/tablets.
+      openBrowser(`http://localhost:${port}`)
       console.log(`  browser: opened (disable with --no-browser)`)
     }
     return
