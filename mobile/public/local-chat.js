@@ -97,12 +97,25 @@ async function loadModel() {
   $("lc-prog").hidden = false
   $("lc-prog-text").hidden = false
   $("lc-prog-text").textContent = "fetching engine…"
+  // Stall detection: on slow connections (or in WebViews where the GPU
+  // worker wedges) the progress callback can go silent — surface a hint
+  // instead of an infinite spinner.
+  let lastProgress = Date.now()
+  const stallTimer = setInterval(() => {
+    if (!loading) return
+    const idle = Math.round((Date.now() - lastProgress) / 1000)
+    if (idle >= 45) {
+      $("lc-prog-text").textContent = `no progress for ${idle}s — slow connection or blocked download? You can wait, or close the page and retry.`
+    }
+  }, 5000)
   try {
     const WebLLM = await import(WEBLLM_URL)
+    lastProgress = Date.now()
     engineModel = model.id
     $("lc-prog-text").textContent = "downloading model…"
     engine = await WebLLM.CreateMLCEngine(model.id, {
       initProgressCallback: (v) => {
+        lastProgress = Date.now()
         const pct = Math.round((v.progress ?? 0) * 100)
         document.querySelector("#lc-prog > div").style.width = `${pct}%`
         $("lc-prog-text").textContent = v.text ? `${pct}% · ${String(v.text).slice(0, 40)}` : `${pct}%`
@@ -111,10 +124,14 @@ async function loadModel() {
     localStorage.setItem(KEYS.model, model.id)
     enterChat()
   } catch (err) {
-    $("lc-sub").innerHTML = `Loading failed: <span class="mono">${escapeHtml(String(err).slice(0, 300))}</span><br>The first load needs an internet connection (model + runtime are cached afterwards).`
+    const msg = err?.message || String(err)
+    $("lc-sub").innerHTML = `Loading failed: <span class="mono">${escapeHtml(msg.slice(0, 300))}</span><br>The first load needs an internet connection (model + runtime are cached afterwards). If this is a phone, the smallest model (Qwen2 0.5B) has the best chance.`
+    $("lc-prog-text").hidden = true
     $("lc-load").textContent = "Try again"
     loading = false
     $("lc-load").disabled = false
+  } finally {
+    clearInterval(stallTimer)
   }
 }
 

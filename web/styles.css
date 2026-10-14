@@ -318,6 +318,7 @@ li.completed .todo-txt { text-decoration: line-through; opacity: 0.65; }
 }
 
 #menu-btn { display: none; }
+#more-btn { display: none; } /* shown at <=600px, see the mobile block below */
 
 #session-title {
   flex: 1;
@@ -1337,6 +1338,39 @@ li.completed .todo-txt { text-decoration: line-through; opacity: 0.65; }
 #export-menu button:hover { background: var(--accent-soft); }
 .em-ext { font-family: var(--mono); font-size: 11px; color: var(--faint); }
 
+/* mobile overflow menu ("More") — same look as the export menu */
+#more-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  min-width: 196px;
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  box-shadow: var(--shadow);
+  padding: 4px;
+}
+#more-menu[hidden] { display: none; }
+#more-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#more-menu button:hover { background: var(--accent-soft); }
+
 /* todo chip: desktop shows the panel in the sidebar; on mobile the
    sidebar is a drawer, so a topbar chip opens it */
 #todo-chip { display: none; }
@@ -1386,4 +1420,24 @@ li.completed .todo-txt { text-decoration: line-through; opacity: 0.65; }
   .msg-text { font-size: 14px; }
   .img-prev { width: 56px; height: 56px; }
   .toast { max-width: calc(100vw - 36px); }
+}
+
+/* phones (<=600px): the full topbar icon row doesn't fit — collapse
+   export / notify / copy-link into the "More" overflow menu, compact the
+   selects, and drop the keyboard hints (meaningless on touch).
+   ID selectors below intentionally out-specify the .topbar-right rules
+   and the base #mode/#model widths. */
+@media (max-width: 600px) {
+  #topbar { gap: 6px; padding: 0 10px; }
+  #session-title { display: none; }
+  .topbar-right { gap: 6px; }
+  #mode { max-width: 76px; padding: 4px 22px 4px 8px; }
+  #model { max-width: 88px; padding: 4px 22px 4px 8px; }
+  #notify-btn,
+  #copy-link,
+  #export-btn,
+  #export-menu { display: none; }
+  #more-btn { display: inline-flex; }
+  #todo-chip { max-width: 44px; padding: 3px 8px; }
+  .composer-hint { display: none; }
 }

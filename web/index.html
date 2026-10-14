@@ -87,6 +87,15 @@
           <button id="copy-link" class="icon-btn" title="Copy session link">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M10 14a4 4 0 0 0 6 .4l3-3a4 4 0 0 0-5.6-5.6l-1.7 1.7"/><path d="M14 10a4 4 0 0 0-6-.4l-3 3a4 4 0 0 0 5.6 5.6l1.7-1.7"/></svg>
           </button>
+          <button id="more-btn" class="icon-btn" title="More (export, notifications, copy link)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h.01M12 12h.01M19 12h.01"/></svg>
+          </button>
+          <div id="more-menu" hidden>
+            <button type="button" data-act="export-md">Export Markdown <span class="em-ext">.md</span></button>
+            <button type="button" data-act="export-html">Export HTML <span class="em-ext">.html</span></button>
+            <button type="button" data-act="notify">Notifications</button>
+            <button type="button" data-act="copy-link">Copy session link</button>
+          </div>
         </div>
       </header>
 

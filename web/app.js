@@ -1369,11 +1369,14 @@ function notifyEnabled() {
 }
 
 function syncNotifyBtn() {
-  const b = $("notify-btn")
-  if (!b) return
   const on = "Notification" in window && Notification.permission === "granted" && notifyEnabled()
-  b.classList.toggle("active", on)
-  b.title = on ? "Notifications: on (when this tab is hidden)" : "Notifications: off"
+  const b = $("notify-btn")
+  if (b) {
+    b.classList.toggle("active", on)
+    b.title = on ? "Notifications: on (when this tab is hidden)" : "Notifications: off"
+  }
+  const m = $("more-menu")?.querySelector('[data-act="notify"]')
+  if (m) m.textContent = on ? "Notifications: on" : "Notifications: off"
 }
 
 async function toggleNotify(forceOff) {
@@ -1610,6 +1613,38 @@ function wireChrome() {
       e.stopPropagation()
       exportMenu.hidden = true
       doExport(b.dataset.fmt)
+    })
+  }
+
+  // Mobile overflow menu ("More"): at <=600px the top bar only has room
+  // for the selects + settings + offline, so export / notify / copy-link
+  // move in here (their buttons are hidden by CSS at that width).
+  const moreMenu = $("more-menu")
+  $("more-btn").addEventListener("click", (e) => {
+    e.stopPropagation()
+    moreMenu.hidden = !moreMenu.hidden
+  })
+  document.addEventListener("click", () => {
+    moreMenu.hidden = true
+  })
+  for (const b of moreMenu.querySelectorAll("button")) {
+    b.addEventListener("click", (e) => {
+      e.stopPropagation()
+      moreMenu.hidden = true
+      switch (b.dataset.act) {
+        case "export-md":
+          doExport("md")
+          break
+        case "export-html":
+          doExport("html")
+          break
+        case "notify":
+          void toggleNotify()
+          break
+        case "copy-link":
+          $("copy-link").click() // hidden, but programmatic clicks still work
+          break
+      }
     })
   }
 
