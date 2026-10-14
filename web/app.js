@@ -630,7 +630,10 @@ function applyState(s) {
   setModelPill(s)
   $("cwd").textContent = s.cwd ?? ""
   $("cwd").title = s.cwd ?? ""
-  $("empty-cwd").textContent = s.cwd ?? ""
+  // #empty (and its #empty-cwd span) is removed from the DOM once the first
+  // message is appended — never assume it is still there.
+  const emptyCwd = $("empty-cwd")
+  if (emptyCwd) emptyCwd.textContent = s.cwd ?? ""
   $("mode").value = s.mode ?? "default"
   renderTodos(s.todos)
   setTokens(s.usage)
@@ -744,7 +747,10 @@ async function openSession(id) {
   setModelPill(s)
   $("cwd").textContent = s.cwd ?? ""
   $("cwd").title = s.cwd ?? ""
-  $("empty-cwd").textContent = s.cwd ?? ""
+  // #empty (and its #empty-cwd span) is removed once the first message is
+  // appended — a later session switch must not crash before connectSSE().
+  const emptyCwd = $("empty-cwd")
+  if (emptyCwd) emptyCwd.textContent = s.cwd ?? ""
   $("mode").value = s.mode ?? "default"
   renderTodos(s.todos)
   setTokens(s.usage)
