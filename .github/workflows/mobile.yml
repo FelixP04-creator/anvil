@@ -51,7 +51,7 @@ jobs:
           path: mobile/android/app/build/outputs/apk/debug/anvil-mobile-*.apk
 
       - name: Attach APK to the release
-        if: startsWith(github.ref, 'v')
+        if: startsWith(github.ref_name, 'v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -103,7 +103,7 @@ jobs:
           path: mobile/ios/build/unsigned/*.ipa
 
       - name: Attach IPA to the release
-        if: startsWith(github.ref, 'v')
+        if: startsWith(github.ref_name, 'v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
