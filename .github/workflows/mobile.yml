@@ -36,7 +36,9 @@ jobs:
 
       - name: Build debug APK
         working-directory: mobile/android
-        run: ./gradlew assembleDebug
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -45,6 +47,7 @@ jobs:
           path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
 
       - name: Attach APK to the release
+        if: startsWith(github.ref, 'v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -73,7 +76,7 @@ jobs:
       - name: Build archive (unsigned)
         working-directory: mobile/ios
         run: |
-          xcodebuild -workspace App.xcworkspace -scheme App \
+          xcodebuild -workspace App/App.xcworkspace -scheme App \
             -configuration Release -destination "generic/platform=iOS" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             archive -archivePath build/anvil.xcarchive
@@ -103,6 +106,7 @@ jobs:
           path: mobile/ios/build/export/*.ipa
 
       - name: Attach IPA to the release
+        if: startsWith(github.ref, 'v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
