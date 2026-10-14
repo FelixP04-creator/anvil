@@ -5,6 +5,11 @@
 #             Apple requires a paid developer account for an App Store build)
 name: mobile
 
+# Creating the release + attaching assets needs contents:write; the repo's
+# default token permissions are read-only.
+permissions:
+  contents: write
+
 on:
   push:
     tags:
