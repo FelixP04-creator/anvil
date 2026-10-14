@@ -43,6 +43,11 @@ export type ContentBlock =
   /** User-attached image. `data` is raw base64 (no data: prefix);
    *  providers convert it to their wire format (image_url / source). */
   | { type: "image"; mediaType: string; data: string }
+  /** User-attached document. When `text` is present the provider inlines the
+   *  text (works for every provider, incl. local runtimes); otherwise `data`
+   *  is raw base64 of a binary document (in practice: PDF) that the provider
+   *  must support natively (Anthropic document block, OpenAI input_file). */
+  | { type: "document"; name: string; mediaType: string; text?: string; data?: string }
 
 export interface Message {
   role: "user" | "assistant"

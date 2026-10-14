@@ -9,6 +9,8 @@ import { join } from "node:path"
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http"
 import { AnvilServer } from "../src/server.ts"
 import { detectLocal } from "../src/local.ts"
+import { resolveSettings } from "../src/config.ts"
+import { OpenAIProvider } from "../src/providers/openai.ts"
 import type { Provider, ProviderRequest, ProviderResponse, ToolInput } from "../src/types.ts"
 
 let failures = 0
@@ -43,17 +45,20 @@ class MockProvider implements Provider {
   script: ProviderResponse[]
   /** true once a completion was handed an AbortSignal (the stop wiring) */
   sawSignal = false
+  /** the most recent request, for inspecting what the providers send */
+  lastReq: ProviderRequest | null = null
 
   constructor(script: ProviderResponse[]) {
     this.script = script
   }
 
   async complete(
-    _req: ProviderRequest,
+    req: ProviderRequest,
     onDelta: (t: string) => void,
     signal?: AbortSignal,
     onThinking?: (t: string) => void,
   ): Promise<ProviderResponse> {
+    this.lastReq = req
     if (signal) this.sawSignal = true
     const resp = this.script.shift() ?? { text: "DONE", toolUse: [], stop: "end_turn" }
     if (resp.thinking) onThinking?.(resp.thinking)
@@ -234,6 +239,29 @@ async function main(): Promise<void> {
   })
   check("invalid mode rejected", badMode.status === 400)
 
+  // Bypass mode: tools that normally need confirmation (Bash) run without
+  // any permission round-trip.
+  const bypassMode = await fetch(`${base}/api/sessions/${id}/mode`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ mode: "bypass" }),
+  })
+  check("bypass mode set", (await bypassMode.json()).ok === true)
+  provider.script.push(
+    { text: "", toolUse: [tu("t4", "Bash", { command: "echo bypass-ok" })], stop: "tool_use" },
+    { text: "Ran it.", toolUse: [], stop: "end_turn", usage: { input: 4, output: 2 } },
+  )
+  const bypassEvents = await runTurn(id, { text: "run the command" })
+  check(
+    "bypass: no permission prompt for Bash",
+    !bypassEvents.some((e: any) => e.type === "permission_request"),
+    JSON.stringify(bypassEvents.filter((e: any) => e.type === "permission_request")),
+  )
+  check(
+    "bypass: Bash executed and reported ok",
+    bypassEvents.some((e: any) => e.type === "tool_end" && e.toolName === "Bash" && e.ok === true),
+  )
+
   console.log("\n— model switching (PATCH session) —")
   const patchRes = await fetch(`${base}/api/sessions/${id}`, {
     method: "PATCH",
@@ -295,7 +323,7 @@ async function main(): Promise<void> {
   const entry = (list.sessions ?? []).find((s: any) => s.id === id)
   check("session list contains the session", !!entry)
   check("list entry has an auto title", entry?.title === "create note.txt")
-  check("list entry carries turn count", entry?.turns === 1)
+  check("list entry carries turn count", entry?.turns === 2)
 
   /** Open SSE, post a message, collect events until turn_end, then cancel. */
   async function runTurn(
@@ -419,6 +447,58 @@ async function main(): Promise<void> {
   })
   check("non-image attachment rejected (400)", badImg.status === 400, `status=${badImg.status}`)
 
+  console.log("\n— document messages —")
+  provider.script.push({ text: "I read the document.", toolUse: [], stop: "end_turn", usage: { input: 22, output: 4 } })
+  const events4 = await runTurn(id, {
+    text: "summarize the notes",
+    docs: [
+      { name: "notes.md", mediaType: "text/markdown", text: "# Notes\nhello from the document" },
+      { name: "report.pdf", mediaType: "application/pdf", data: "JVBERi0xLjQK" },
+    ],
+  })
+  check("doc answer streamed", events4.some((e: any) => e.type === "assistant_text" && String(e.text).includes("document")))
+  const tr4 = await (await fetch(`${base}/api/sessions/${id}/transcript`)).json()
+  const userDoc = (tr4.entries ?? []).find((e: any) => e.role === "user" && Array.isArray(e.docs) && e.docs.length === 2)
+  check(
+    "transcript keeps the attached documents (text + binary)",
+    userDoc?.docs?.[0]?.name === "notes.md" && userDoc?.docs?.[0]?.hasText === true &&
+      userDoc?.docs?.[1]?.name === "report.pdf" && userDoc?.docs?.[1]?.hasText === false,
+    JSON.stringify(userDoc?.docs),
+  )
+  // The provider request (anvil's internal format) must carry both docs.
+  const lastUser = [...(provider.lastReq?.messages ?? [])].reverse().find((m: any) => m.role === "user")
+  const flatUser = JSON.stringify(lastUser ?? {})
+  check("text doc kept in the provider request", flatUser.includes('"notes.md"') && flatUser.includes("hello from the document"))
+  check("binary doc kept in the provider request", flatUser.includes('"report.pdf"'))
+  // Wire conversion: Anthropic inlines text docs and sends the PDF as a
+  // native document block; the OpenAI provider uses input_file for PDFs.
+  const { toApiMessages } = await import("../src/providers/anthropic.ts")
+  const { toOpenAIMessages } = await import("../src/providers/openai.ts")
+  const apiFlat = JSON.stringify([...(toApiMessages(provider.lastReq?.messages ?? []) as any[])].reverse().find((m: any) => m.role === "user") ?? {})
+  check(
+    "anthropic wire: text doc inlined, pdf as document block",
+    apiFlat.includes("Attached document: notes.md") && apiFlat.includes('"type":"document"') && apiFlat.includes('"media_type":"application/pdf"'),
+    apiFlat.slice(0, 240),
+  )
+  const oaFlat = JSON.stringify([...(toOpenAIMessages(provider.lastReq?.messages ?? []) as any[])].reverse().find((m: any) => m.role === "user") ?? {})
+  check(
+    "openai wire: text doc inlined, pdf as input_file",
+    oaFlat.includes("Attached document: notes.md") && oaFlat.includes('"type":"input_file"') && oaFlat.includes("data:application/pdf;base64,"),
+    oaFlat.slice(0, 240),
+  )
+  const badDoc = await fetch(`${base}/api/sessions/${id}/messages`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ docs: [{ name: "", mediaType: "text/plain", text: "x" }] }),
+  })
+  check("doc without a name rejected (400)", badDoc.status === 400, `status=${badDoc.status}`)
+  const emptyDoc = await fetch(`${base}/api/sessions/${id}/messages`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ docs: [{ name: "a.txt", mediaType: "text/plain" }] }),
+  })
+  check("doc without text/data rejected (400)", emptyDoc.status === 400, `status=${emptyDoc.status}`)
+
   console.log("\n— fork —")
   const forkRes = await fetch(`${base}/api/sessions/${id}/fork`, {
     method: "POST",
@@ -479,12 +559,12 @@ async function main(): Promise<void> {
     return null
   })()
   check("session file written next to config", diskRaw !== null && JSON.parse(diskRaw).id === id)
-  check("session file stores usage totals", JSON.parse(diskRaw!).usage.input === 69 && JSON.parse(diskRaw!).usage.output === 25, JSON.stringify(JSON.parse(diskRaw!).usage))
+  check("session file stores usage totals", JSON.parse(diskRaw!).usage.input === 95 && JSON.parse(diskRaw!).usage.output === 31, JSON.stringify(JSON.parse(diskRaw!).usage))
 
   const sessList = await (await fetch(`${base}/api/sessions`)).json()
   const listEntry = (sessList.sessions ?? []).find((s: any) => s.id === id)
   check("session list contains the persisted session", !!listEntry)
-  check("list entry carries usage totals", listEntry?.usage?.input === 69 && listEntry?.usage?.output === 25, JSON.stringify(listEntry?.usage))
+  check("list entry carries usage totals", listEntry?.usage?.input === 95 && listEntry?.usage?.output === 31, JSON.stringify(listEntry?.usage))
   check("list entry carries updatedAt", typeof listEntry?.updatedAt === "number")
 
   console.log("\n— persistence: adoption across a restart —")
@@ -497,7 +577,7 @@ async function main(): Promise<void> {
   const adoptState = await fetch(`${base3}/api/sessions/${id}`)
   check("second server adopts the session on demand", adoptState.status === 200)
   const adoptBody = await adoptState.json()
-  check("adopted session keeps its history", adoptBody.msgCount === 10, `msgCount=${adoptBody.msgCount}`)
+  check("adopted session keeps its history", adoptBody.msgCount === 16, `msgCount=${adoptBody.msgCount}`)
   check("adopted session is idle", adoptBody.busy === false)
   check("adopted session keeps its model override", adoptBody.model === "custom-model", `model=${adoptBody.model}`)
 
@@ -579,6 +659,13 @@ async function main(): Promise<void> {
   check("hsnr key flagged in view", cfgHsnr.hasHsnrKey === true)
   check("hsnr key masked in view", cfgHsnr.hsnrKey === "owui-te…1234", String(cfgHsnr.hsnrKey))
   check("hsnr default model picked", cfgHsnr.model === "Qwen/Qwen3.8-27B", cfgHsnr.model)
+  // Regression: the config-file path (used by the CLI server) must build
+  // the hsnr provider without input_file support, like makeProvider().
+  const resolvedHsnr = await resolveSettings({ provider: "hsnr" })
+  check(
+    "hsnr config path disables input_file",
+    resolvedHsnr.provider instanceof OpenAIProvider && resolvedHsnr.provider.supportsInputFile === false,
+  )
   const cfgHsnr2 = await fetch(`${base}/api/config`, {
     method: "PUT",
     headers: jsonHdr,
@@ -672,6 +759,73 @@ async function main(): Promise<void> {
   })
   const cfgLocalDead = await cfgPutLocalDead.json()
   check("local saved while runtime is down", cfgLocalDead.ok === true && /not active/.test(cfgLocalDead.note ?? ""), JSON.stringify(cfgLocalDead.note))
+
+  // Binary documents (PDF) are rejected for local sessions — local runtimes
+  // cannot read them, so fail early with a clear message. Text docs pass.
+  const serverL = new AnvilServer({
+    provider: new MockProvider([{ text: "unused", toolUse: [], stop: "end_turn" }]),
+    kind: "local",
+    model: "mock-llm-1",
+    thinking: "off",
+    cwd: dir,
+  })
+  const baseL = `http://127.0.0.1:${await serverL.listen(0)}`
+  const createdL = await (
+    await fetch(`${baseL}/api/sessions`, { method: "POST", headers: jsonHdr, body: JSON.stringify({ mode: "default" }) })
+  ).json()
+  const pdfLocal = await fetch(`${baseL}/api/sessions/${createdL.id}/messages`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ text: "read it", docs: [{ name: "r.pdf", mediaType: "application/pdf", data: "QUFB" }] }),
+  })
+  const pdfLocalBody = await pdfLocal.json().catch(() => ({}))
+  check(
+    "local session rejects binary docs (400)",
+    pdfLocal.status === 400 && /no text could be extracted/i.test(pdfLocalBody.error ?? ""),
+    JSON.stringify(pdfLocalBody),
+  )
+  const txtLocal = await fetch(`${baseL}/api/sessions/${createdL.id}/messages`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ text: "read it", docs: [{ name: "r.txt", mediaType: "text/plain", text: "hello" }] }),
+  })
+  check("local session accepts text docs (202)", txtLocal.status === 202, `status=${txtLocal.status}`)
+  await serverL.close()
+
+  // The hsnr gateway (litellm) rejects input_file parts too — the same guard
+  // applies. A PDF with extracted text passes (that text is what hsnr gets).
+  const serverH = new AnvilServer({
+    provider: new MockProvider([{ text: "unused", toolUse: [], stop: "end_turn" }]),
+    kind: "hsnr",
+    model: "mock-llm-1",
+    thinking: "off",
+    cwd: dir,
+  })
+  const baseH = `http://127.0.0.1:${await serverH.listen(0)}`
+  const createdH = await (
+    await fetch(`${baseH}/api/sessions`, { method: "POST", headers: jsonHdr, body: JSON.stringify({ mode: "default" }) })
+  ).json()
+  const pdfH = await fetch(`${baseH}/api/sessions/${createdH.id}/messages`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({ text: "read it", docs: [{ name: "r.pdf", mediaType: "application/pdf", data: "QUFB" }] }),
+  })
+  const pdfHBody = await pdfH.json().catch(() => ({}))
+  check(
+    "hsnr session rejects binary-only PDFs (400)",
+    pdfH.status === 400 && /no text could be extracted/i.test(pdfHBody.error ?? ""),
+    JSON.stringify(pdfHBody),
+  )
+  const pdfHText = await fetch(`${baseH}/api/sessions/${createdH.id}/messages`, {
+    method: "POST",
+    headers: jsonHdr,
+    body: JSON.stringify({
+      text: "read it",
+      docs: [{ name: "r.pdf", mediaType: "application/pdf", data: "QUFB", text: "extracted pdf content" }],
+    }),
+  })
+  check("hsnr session accepts PDFs with extracted text (202)", pdfHText.status === 202, `status=${pdfHText.status}`)
+  await serverH.close()
 
   // Restore the pre-section config state.
   writeFileSync(cfgFile, cfgFileRaw, "utf8")

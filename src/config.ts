@@ -179,6 +179,10 @@ export async function resolveSettings(ov: SettingsOverride = {}): Promise<Resolv
             key,
             process.env.HSNR_BASE_URL || file.hsnrBaseUrl || HSNR_DEFAULT_BASE_URL,
             true,
+            undefined,
+            // The hsnr gateway rejects input_file parts; PDFs travel as
+            // extracted text instead (see providers/index.ts).
+            false,
           )
         : new OpenAIProvider(
             key,

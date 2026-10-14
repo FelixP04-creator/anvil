@@ -38,6 +38,8 @@ const WEB_FILES = [
   "index.html",
   "app.js",
   "md.js",
+  "office-text.js",
+  "pdf-text.js",
   "styles.css",
   "local-chat.html",
   "local-chat.js",

@@ -38,7 +38,10 @@ export function defaultModelFor(kind: ProviderKind): string {
 
 export function makeProvider(kind: ProviderKind, apiKey: string, baseUrl?: string): Provider {
   if (kind === "anthropic") return new AnthropicProvider(apiKey)
-  if (kind === "hsnr") return new OpenAIProvider(apiKey, baseUrl || HSNR_DEFAULT_BASE_URL, true)
+  // The hsnr gateway (litellm) validates chat messages strictly and rejects
+  // input_file parts — PDFs must travel as extracted text there.
+  if (kind === "hsnr")
+    return new OpenAIProvider(apiKey, baseUrl || HSNR_DEFAULT_BASE_URL, true, undefined, false)
   if (kind === "local") return makeLocalProvider(baseUrl)
   return new OpenAIProvider(apiKey, baseUrl || "https://api.openai.com/v1")
 }
@@ -52,5 +55,6 @@ export function makeLocalProvider(baseUrl?: string): Provider {
     baseUrl || LOCAL_DEFAULT_BASE_URL,
     false,
     LOCAL_CONNECT_TIMEOUT_MS,
+    false,
   )
 }

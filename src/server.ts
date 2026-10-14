@@ -97,8 +97,24 @@ interface ConfigView {
 
 export type ServerEvent = { type: string } & Record<string, unknown>
 
+export interface TranscriptDoc {
+  name: string
+  mediaType: string
+  /** true when the attachment is (or was) inlined as text into the prompt. */
+  hasText: boolean
+}
+
+/** A document uploaded with a message. Text documents carry `text`; binary
+ *  documents (PDF) carry `data` (raw base64, no data: prefix). */
+export interface AttachedDoc {
+  name: string
+  mediaType: string
+  text?: string
+  data?: string
+}
+
 export type TranscriptEntry =
-  | { role: "user"; text: string; msgIndex?: number; images?: { mediaType: string; data: string }[] }
+  | { role: "user"; text: string; msgIndex?: number; images?: { mediaType: string; data: string }[]; docs?: TranscriptDoc[] }
   | { role: "assistant"; text: string; msgIndex?: number }
   | { role: "thinking"; text: string; msgIndex?: number }
   | { role: "tool"; name: string; args: ToolInput; ok: boolean; output: string; pending?: boolean; msgIndex?: number }
@@ -405,9 +421,12 @@ export class Session {
       } else {
         let text = ""
         const images: { mediaType: string; data: string }[] = []
+        const docs: TranscriptDoc[] = []
         for (const b of m.content) {
           if (b.type === "text") text += (text ? "\n\n" : "") + b.text
           else if (b.type === "image") images.push({ mediaType: b.mediaType, data: b.data })
+          else if (b.type === "document")
+            docs.push({ name: b.name, mediaType: b.mediaType, hasText: !!b.text })
           else if (b.type === "tool_result") {
             for (let k = out.length - 1; k >= 0; k--) {
               const e = out[k]
@@ -420,12 +439,13 @@ export class Session {
             }
           }
         }
-        if (text || images.length) {
+        if (text || images.length || docs.length) {
           out.push({
             role: "user",
             text,
             msgIndex: i,
             ...(images.length ? { images } : {}),
+            ...(docs.length ? { docs } : {}),
           })
         }
       }
@@ -452,13 +472,20 @@ export class Session {
     return out
   }
 
-  async send(text: string, images: { mediaType: string; data: string }[] = []): Promise<void> {
+  async send(
+    text: string,
+    images: { mediaType: string; data: string }[] = [],
+    docs: AttachedDoc[] = [],
+  ): Promise<void> {
     if (this.busy) throw new Error("session is busy with another turn")
     this.busy = true
     this.changes = []
     const content: ContentBlock[] = [{ type: "text", text }]
     for (const img of images.slice(0, 8)) {
       content.push({ type: "image", mediaType: img.mediaType, data: img.data })
+    }
+    for (const d of docs.slice(0, 8)) {
+      content.push({ type: "document", name: d.name, mediaType: d.mediaType, text: d.text, data: d.data })
     }
     this.history.push({ role: "user", content })
     const ac = new AbortController()
@@ -932,7 +959,8 @@ export class AnvilServer {
         if (method === "GET" && sub === "events") return this.handleEvents(req, res, session)
 
         if (method === "POST" && sub === "messages") {
-          const body = await readJson(req, 15_000_000)
+          // 30 MB: a 12 MB PDF arrives as ~16 MB of base64, on top of images.
+          const body = await readJson(req, 30_000_000)
           const text = typeof body?.text === "string" ? body.text : ""
           const images: { mediaType: string; data: string }[] = []
           if (Array.isArray(body?.images)) {
@@ -948,9 +976,36 @@ export class AnvilServer {
               }
             }
           }
-          if (!text && images.length === 0) return json(res, 400, { error: "text and/or images are required" })
+          const docs: AttachedDoc[] = []
+          if (Array.isArray(body?.docs)) {
+            for (const d of body.docs as unknown[]) {
+              const o = d as { name?: unknown; mediaType?: unknown; text?: unknown; data?: unknown } | null
+              const name = o && typeof o.name === "string" ? o.name.slice(0, 255) : ""
+              const mediaType = o && typeof o.mediaType === "string" ? o.mediaType.slice(0, 100) : ""
+              const docText = o && typeof o.text === "string" ? o.text : undefined
+              const docData = o && typeof o.data === "string" ? o.data : undefined
+              if (!name || !mediaType || (docText === undefined && docData === undefined)) continue
+              if (docText !== undefined && docText.length > 2_000_000) continue
+              if (docData !== undefined && docData.length > 20_000_000) continue
+              if (docs.length >= 8) break
+              docs.push({ name, mediaType, text: docText, data: docData })
+            }
+          }
+          if (!text && images.length === 0 && docs.length === 0)
+            return json(res, 400, { error: "text, image or document is required" })
+          // hsnr (litellm) and local runtimes cannot read PDF bytes; if the
+          // client extracted no text, fail early with a clear message.
+          if (
+            (session.kind === "local" || session.kind === "hsnr") &&
+            docs.some((d) => d.text === undefined)
+          ) {
+            return json(res, 400, {
+              error:
+                "This model cannot read the PDF directly and no text could be extracted from it. Please export the document as .docx or plain text and attach that instead.",
+            })
+          }
           if (session.busy) return json(res, 409, { error: "session is busy with another turn" })
-          session.send(text, images).catch((err) => {
+          session.send(text, images, docs).catch((err) => {
             session.broadcast({ type: "error", text: String(err) })
           })
           return json(res, 202, { started: true })

@@ -4,6 +4,7 @@
 // signature, which the API requires on the next turn).
 
 import type { Message, Provider, ProviderRequest, ProviderResponse, ToolInput, ThinkingEffort } from "../types.ts"
+import { docTextBlock } from "./documents.ts"
 import {
   CONNECT_TIMEOUT_MS,
   FIRST_CHUNK_TIMEOUT_MS,
@@ -40,7 +41,7 @@ function safeParse(s: string): unknown {
 
 /** Map anvil's internal messages to the wire format (only thinking blocks
  *  use a different field name). */
-function toApiMessages(messages: Message[]): unknown[] {
+export function toApiMessages(messages: Message[]): unknown[] {
   return messages.map((m) => ({
     role: m.role,
     content: m.content.map((b) => {
@@ -54,6 +55,19 @@ function toApiMessages(messages: Message[]): unknown[] {
           type: "image",
           source: { type: "base64", media_type: b.mediaType, data: b.data },
         }
+      }
+      if (b.type === "document") {
+        // PDFs go out as native document blocks (layout-preserving), even
+        // when extracted text is available alongside them; text documents
+        // are inlined as delimited text.
+        if (b.mediaType === "application/pdf" && b.data) {
+          return {
+            type: "document",
+            source: { type: "base64", media_type: "application/pdf", data: b.data },
+          }
+        }
+        if (b.text !== undefined) return docTextBlock(b)
+        return { type: "text", text: `[Document ${b.name}: binary content — not readable]` }
       }
       return b
     }),

@@ -1262,6 +1262,73 @@ li.completed .todo-txt { text-decoration: line-through; opacity: 0.65; }
 }
 .img-prev-x:hover { background: var(--err); }
 
+/* ---------- attached documents ---------- */
+
+.doc-prev {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 64px;
+  max-width: 220px;
+  padding: 0 32px 0 10px;
+  border: 1px solid var(--border-2);
+  border-radius: 9px;
+  background: var(--bg-3);
+}
+.doc-prev > svg { width: 22px; height: 22px; flex: none; color: var(--muted); }
+.doc-prev.busy { opacity: 0.55; }
+.doc-prev-name {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.doc-prev-x {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.doc-prev-x:hover { background: var(--err); }
+
+.user-docs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.user-doc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  padding: 4px 9px;
+  border: 1px solid var(--border-2);
+  border-radius: 8px;
+  background: var(--bg-3);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.user-doc-chip > svg { width: 14px; height: 14px; flex: none; color: var(--muted); }
+.user-doc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-doc-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--bg-2);
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 #attach-btn {
   flex: 0 0 auto;
   width: 32px;

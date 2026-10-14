@@ -4,7 +4,8 @@
 // models (or all models when forceReasoning is set, as on the hsnr gateway),
 // and streamed reasoning text (reasoning_content) is surfaced.
 
-import type { Message, Provider, ProviderRequest, ProviderResponse, ToolInput, ThinkingEffort } from "../types.ts"
+import type { ContentBlock, Message, Provider, ProviderRequest, ProviderResponse, ToolInput, ThinkingEffort } from "../types.ts"
+import { docTextBlock } from "./documents.ts"
 import {
   CONNECT_TIMEOUT_MS,
   FIRST_CHUNK_TIMEOUT_MS,
@@ -13,6 +14,9 @@ import {
   connectSignal,
   withTimeout,
 } from "./timeouts.ts"
+
+const isDocumentBlock = (b: ContentBlock): b is Extract<ContentBlock, { type: "document" }> =>
+  b.type === "document"
 
 interface ToolCallAcc {
   id: string
@@ -49,8 +53,17 @@ function reasoningEffortFor(
 }
 
 /** Convert anvil's internal messages to the OpenAI chat format. Thinking
- *  blocks are not part of the OpenAI history format and are skipped. */
-function toOpenAIMessages(messages: Message[]): any[] {
+ *  blocks are not part of the OpenAI history format and are skipped.
+ *  `supportsInputFile` is false for gateways that reject the input_file
+ *  part type (hsnr) and for local runtimes — there, PDFs travel as their
+ *  extracted text instead (the server rejects binary-only docs for those
+ *  kinds, so a binary doc without text only ever happens for stale
+ *  history and degrades to a plain note). */
+export function toOpenAIMessages(
+  messages: Message[],
+  opts?: { supportsInputFile?: boolean },
+): any[] {
+  const supportsInputFile = opts?.supportsInputFile ?? true
   const out: any[] = []
   for (const m of messages) {
     if (m.role === "assistant") {
@@ -78,23 +91,41 @@ function toOpenAIMessages(messages: Message[]): any[] {
       const images = m.content.filter(
         (b): b is Extract<typeof b, { type: "image" }> => b.type === "image",
       )
-      if (texts.length || images.length) {
-        if (images.length === 0) {
-          out.push({ role: "user", content: texts.join("") })
-        } else {
-          // Multimodal user turn: content becomes a part array with the
-          // text first and one image_url part per attached image.
-          out.push({
-            role: "user",
-            content: [
-              ...(texts.length ? [{ type: "text", text: texts.join("") }] : []),
-              ...images.map((b) => ({
-                type: "image_url",
-                image_url: { url: `data:${b.mediaType};base64,${b.data}` },
-              })),
-            ],
-          })
-        }
+      const docs = m.content.filter(isDocumentBlock)
+      const parts: any[] = [
+        ...(texts.length ? [{ type: "text", text: texts.join("") }] : []),
+        // Documents that are not sent as native PDF parts are inlined as
+        // delimited text parts; a binary doc the endpoint cannot read
+        // degrades to a plain note instead of an invalid message.
+        ...docs
+          .filter((d) => !(d.mediaType === "application/pdf" && d.data && supportsInputFile))
+          .map((d) =>
+            d.text !== undefined
+              ? docTextBlock(d)
+              : { type: "text", text: `[Document ${d.name}: binary content — not readable by this model]` },
+          ),
+        ...images.map((b) => ({
+          type: "image_url",
+          image_url: { url: `data:${b.mediaType};base64,${b.data}` },
+        })),
+        // PDFs go out as native input_file parts on endpoints that accept
+        // them (api.openai.com). The hsnr gateway validates strictly and
+        // rejects unknown part types.
+        ...docs
+          .filter((d) => d.mediaType === "application/pdf" && d.data && supportsInputFile)
+          .map((d) => ({
+            type: "input_file",
+            input_file: { file_data: `data:${d.mediaType};base64,${d.data}`, filename: d.name },
+          })),
+      ]
+      if (parts.length === 1 && parts[0].type === "text") {
+        // Plain text-only user message (or a single text document) — keep
+        // the compact string form.
+        out.push({ role: "user", content: parts[0].text })
+      } else if (parts.length > 0) {
+        // Multimodal user turn (image / binary document): content becomes
+        // a part array.
+        out.push({ role: "user", content: parts })
       }
       for (const b of m.content) {
         if (b.type === "tool_result") {
@@ -115,17 +146,22 @@ export class OpenAIProvider implements Provider {
   /** Connect phase budget — local runtimes may need minutes to load a
    *  model's weights on first use. */
   connectTimeoutMs: number
+  /** Whether the endpoint accepts input_file parts (native PDFs).
+   *  api.openai.com does; the hsnr gateway and local runtimes do not. */
+  supportsInputFile: boolean
 
   constructor(
     apiKey: string,
     baseUrl = "https://api.openai.com/v1",
     forceReasoning = false,
     connectTimeoutMs = CONNECT_TIMEOUT_MS,
+    supportsInputFile = true,
   ) {
     this.apiKey = apiKey
     this.baseUrl = baseUrl
     this.forceReasoning = forceReasoning
     this.connectTimeoutMs = connectTimeoutMs
+    this.supportsInputFile = supportsInputFile
   }
 
   async complete(
@@ -151,7 +187,7 @@ export class OpenAIProvider implements Provider {
       ...(reasoning ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
       messages: [
         { role: "system", content: req.system },
-        ...toOpenAIMessages(req.messages),
+        ...toOpenAIMessages(req.messages, { supportsInputFile: this.supportsInputFile }),
       ],
       tools: req.tools.map((t) => ({
         type: "function",

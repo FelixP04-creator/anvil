@@ -6,6 +6,8 @@
 // that only gets formatted when the message completes.
 
 import { escapeHtml, renderMarkdown } from "./md.js"
+import { officeToText } from "./office-text.js"
+import { pdfToText } from "./pdf-text.js"
 
 const $ = (id) => document.getElementById(id)
 
@@ -37,9 +39,11 @@ const renderedPerms = new Set() // permission ids already on screen
 const permCards = new Map() // permId -> { card, decided }
 
 let pendingImages = [] // { file, url } attached to the next message
+let pendingDocs = [] // { name, mediaType, text?|data?, busy? } attached to the next message
 let lastMsgCount = 0 // history length (fork point for /fork)
 let allSessions = [] // last session listing (for the search filter)
 let slashIdx = 0
+let sessionKind = null // provider kind of the open session ("hsnr", "local", …)
 
 // ---------------------------------------------------------------- helpers
 
@@ -88,6 +92,7 @@ const ICONS = {
   mark: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.8 4.4c.3-.3.8-.4 1.2-.4h12.3c1.6 0 3.1.5 4.3 1.4.5.3.6 1 .2 1.5l-.8 1c-1 1.2-2.4 2-4 2.4v2.1c0 .7-.5 1.2-1.2 1.2h-1.3v2.6c1.7.4 3 1.5 3.6 3.2.2.6-.2 1.2-.9 1.2H5.6c-.7 0-1.1-.6-.9-1.2.6-1.7 1.9-2.8 3.6-3.2v-2.6H7c-.7 0-1.2-.5-1.2-1.2v-2.1c-1.7-.5-3.2-1.6-4.3-3.1-.3-.5-.2-1.2.3-1.8z"/></svg>',
   think: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4l1.6 4.4L18 10l-4.4 1.6L12 16l-1.6-4.4L6 10l4.4-1.6z"/><path d="M18.8 14.5l.9 2.3 2.3.9-2.3.9-.9 2.3-.9-2.3-2.3-.9 2.3-.9z"/></svg>',
   fork: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5.5" r="2.3"/><circle cx="6" cy="18.5" r="2.3"/><circle cx="18" cy="12" r="2.3"/><path d="M6 7.8v8.4M8 6.6c4.5 1 6.7 2.7 7.7 4.6"/></svg>',
+  doc: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2.5h7L18.5 8v13a.5.5 0 0 1-.5.5H6a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5z"/><path d="M13 2.5V8h5.5"/><path d="M8.5 13h7M8.5 16.5h5"/></svg>',
 }
 
 // ---------------------------------------------------------------- messages
@@ -119,7 +124,7 @@ function append(node) {
   return node
 }
 
-function userMsg(text, images) {
+function userMsg(text, images, docs) {
   const wrap = el("div", "msg user")
   if (text) wrap.appendChild(el("div", "user-text", text))
   if (images && images.length) {
@@ -133,6 +138,23 @@ function userMsg(text, images) {
     }
     if (images.length > 6) grid.appendChild(el("span", "user-imgs-more", `+${images.length - 6}`))
     wrap.appendChild(grid)
+  }
+  if (docs && docs.length) {
+    const row = el("div", "user-docs")
+    for (const d of docs) {
+      const chip = el("div", "user-doc-chip")
+      chip.innerHTML = ICONS.doc
+      const name = el("span", "user-doc-name", d.name)
+      name.title = d.mediaType || d.name
+      const tag = el(
+        "span",
+        "user-doc-tag",
+        d.mediaType === "application/pdf" ? "PDF" : d.kind === "office" ? "Office" : "Text",
+      )
+      chip.append(name, tag)
+      row.appendChild(chip)
+    }
+    wrap.appendChild(row)
   }
   return append(wrap)
 }
@@ -632,6 +654,7 @@ function setModelPill(s) {
 }
 
 function applyState(s) {
+  sessionKind = s.kind ?? null
   $("session-title").textContent = s.title ?? "New session"
   setModelPill(s)
   $("cwd").textContent = s.cwd ?? ""
@@ -796,7 +819,11 @@ async function openSession(id) {
 function renderTranscript(entries) {
   for (const e of entries) {
     if (e.role === "user") {
-      userMsg(e.text, (e.images ?? []).map((im) => ({ url: `data:${im.mediaType};base64,${im.data}`, name: "" })))
+      userMsg(
+        e.text,
+        (e.images ?? []).map((im) => ({ url: `data:${im.mediaType};base64,${im.data}`, name: "" })),
+        e.docs,
+      )
     } else if (e.role === "thinking") {
       renderThinking(e.text)
     } else if (e.role === "assistant") {
@@ -1006,33 +1033,151 @@ function handle(ev) {
   }
 }
 
-// ---------------------------------------------------------------- images
+// ---------------------------------------------------------------- attachments
+// Images pass through as-is; documents are turned into text (text-like and
+// Office files, extracted in the browser) or base64 (PDF), so every provider
+// — including local runtimes — can actually use them.
 
-function addImageFiles(fileList) {
+const TEXT_EXTS = new Set([
+  "txt", "md", "markdown", "csv", "tsv", "json", "ndjson", "jsonl", "xml", "yml", "yaml",
+  "html", "htm", "css", "scss", "less", "js", "mjs", "cjs", "ts", "tsx", "jsx", "py",
+  "ipynb", "java", "c", "h", "cpp", "hpp", "cc", "cs", "go", "rs", "rb", "php", "sh",
+  "bash", "zsh", "ps1", "bat", "log", "sql", "ini", "toml", "cfg", "conf", "env",
+  "lua", "pl", "r", "swift", "kt", "scala", "dart", "vue", "svelte", "proto",
+  "graphql", "gql", "tex", "rst", "adoc", "makefile", "dockerfile", "gitignore",
+])
+const TEXT_MIMES = new Set([
+  "application/json", "application/xml", "application/javascript", "application/typescript",
+  "application/sql", "application/x-sh", "application/x-yaml", "application/yaml",
+])
+const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "ico", "heic"])
+/** Max chars of a document inlined into the prompt (keeps the context
+ *  usable); longer files are truncated with a note. */
+const DOC_TEXT_MAX = 512 * 1024
+
+function extOf(name) {
+  const s = String(name)
+  const i = s.lastIndexOf(".")
+  return i >= 0 ? s.slice(i + 1).toLowerCase() : ""
+}
+
+function isImageFile(f) {
+  const t = (f.type || "").toLowerCase()
+  return t.startsWith("image/") || IMAGE_EXTS.has(extOf(f.name))
+}
+
+/** Classify a non-image file: "text", "office" (.docx/.xlsx/.pptx), "pdf",
+ *  or null when anvil cannot use the format. */
+function classifyDoc(f) {
+  const ext = extOf(f.name)
+  const t = (f.type || "").toLowerCase()
+  if (ext === "pdf" || t === "application/pdf") return "pdf"
+  if (ext === "docx" || ext === "xlsx" || ext === "pptx") return "office"
+  if (TEXT_EXTS.has(ext) || t.startsWith("text/") || TEXT_MIMES.has(t)) return "text"
+  return null
+}
+
+function truncateDocText(text, name) {
+  if (text.length <= DOC_TEXT_MAX) return text
+  return (
+    text.slice(0, DOC_TEXT_MAX) +
+    `\n\n[... "${name}" truncated: only the first ${DOC_TEXT_MAX / 1024} KB are inlined ...]`
+  )
+}
+
+function bytesToBase64(bytes) {
+  let s = ""
+  const CH = 0x8000
+  for (let i = 0; i < bytes.length; i += CH) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH))
+  }
+  return btoa(s)
+}
+
+// Office extraction (.docx/.xlsx/.pptx) and PDF text extraction
+// (pdf-text.js) live in DOM-free modules — pure functions shared with the
+// Node test suite.
+
+/** Read a file into the wire shape: text documents carry `text`; PDFs carry
+ *  `data` (raw base64) plus `text` when the extractor recovered content —
+ *  the server picks the representation per provider (native PDF block for
+ *  Anthropic/OpenAI, extracted text for hsnr/local). */
+async function ingestDoc(file, kind) {
+  if (kind === "pdf") {
+    const buf = await file.arrayBuffer()
+    const data = bytesToBase64(new Uint8Array(buf))
+    let text = ""
+    try {
+      text = (await pdfToText(buf)) ?? ""
+    } catch {
+      // Extraction failed — the binary path still works for Anthropic/OpenAI.
+    }
+    if (text.trim().length >= 4) {
+      return { mediaType: "application/pdf", data, text: truncateDocText(text, file.name) }
+    }
+    return { mediaType: "application/pdf", data }
+  }
+  const text = kind === "office" ? await officeToText(file.name, await file.arrayBuffer()) : await file.text()
+  return { mediaType: file.type || "application/octet-stream", text: truncateDocText(text, file.name) }
+}
+
+async function addFiles(fileList) {
   const files = [...(fileList ?? [])]
   for (const f of files) {
     if (!f) continue
-    if (!f.type || !f.type.startsWith("image/")) {
-      toast(`skipped "${f.name}": not an image`, "err")
+    if (isImageFile(f)) {
+      if (pendingImages.length >= 8) {
+        toast("Max 8 images per message", "err")
+        break
+      }
+      if (f.size > 10 * 1024 * 1024) {
+        toast(`"${f.name}" is too big (max 10 MB)`, "err")
+        continue
+      }
+      pendingImages.push({ file: f, url: URL.createObjectURL(f) })
+      renderPreviews()
       continue
     }
-    if (pendingImages.length >= 8) {
-      toast("Max 8 images per message", "err")
+    const kind = classifyDoc(f)
+    if (!kind) {
+      toast(
+        `skipped "${f.name}": unsupported format — convert it to PDF, .docx, .xlsx, .pptx or plain text`,
+        "err",
+      )
+      continue
+    }
+    if (f.size > 15 * 1024 * 1024) {
+      toast(`"${f.name}" is too big (max 15 MB)`, "err")
+      continue
+    }
+    if (pendingDocs.length >= 8) {
+      toast("Max 8 documents per message", "err")
       break
     }
-    if (f.size > 10 * 1024 * 1024) {
-      toast(`"${f.name}" is too big (max 10 MB)`, "err")
-      continue
+    // Reserve the slot immediately so the limit holds while we read.
+    const entry = { name: f.name, mediaType: f.type || "", kind, busy: true }
+    pendingDocs.push(entry)
+    renderPreviews()
+    try {
+      Object.assign(entry, await ingestDoc(f, kind))
+      entry.busy = false
+    } catch (err) {
+      pendingDocs.splice(pendingDocs.indexOf(entry), 1)
+      toast(`could not read "${f.name}": ${String((err && err.message) || err)}`, "err")
     }
-    pendingImages.push({ file: f, url: URL.createObjectURL(f) })
+    renderPreviews()
   }
-  renderImagePreviews()
 }
 
-function renderImagePreviews() {
+function docPreviewSize(d) {
+  const bytes = d.text ? d.text.length : d.data ? Math.round(d.data.length * 0.75) : 0
+  return Math.max(1, Math.round(bytes / 1024))
+}
+
+function renderPreviews() {
   const row = $("img-previews")
   row.innerHTML = ""
-  row.hidden = pendingImages.length === 0
+  row.hidden = pendingImages.length === 0 && pendingDocs.length === 0
   pendingImages.forEach((p, i) => {
     const d = el("div", "img-prev")
     const img = document.createElement("img")
@@ -1045,17 +1190,44 @@ function renderImagePreviews() {
     x.addEventListener("click", () => {
       URL.revokeObjectURL(p.url)
       pendingImages.splice(i, 1)
-      renderImagePreviews()
+      renderPreviews()
     })
     d.appendChild(x)
     row.appendChild(d)
   })
+  pendingDocs.forEach((p, i) => {
+    const c = el("div", "doc-prev" + (p.busy ? " busy" : ""))
+    c.innerHTML = ICONS.doc
+    const label = el("span", "doc-prev-name")
+    label.textContent = p.busy ? `${p.name} …` : p.name
+    label.title = p.busy ? "reading…" : `${p.name} (${docPreviewSize(p)} KB)`
+    c.appendChild(label)
+    const x = el("button", "doc-prev-x", "×")
+    x.type = "button"
+    x.title = "Remove document"
+    x.addEventListener("click", () => {
+      pendingDocs.splice(i, 1)
+      renderPreviews()
+    })
+    c.appendChild(x)
+    row.appendChild(c)
+  })
 }
 
-function clearImages() {
+function clearAttachments() {
   for (const p of pendingImages) URL.revokeObjectURL(p.url)
   pendingImages = []
-  renderImagePreviews()
+  pendingDocs = []
+  renderPreviews()
+}
+
+function readDocs() {
+  return pendingDocs.map((d) => ({
+    name: d.name,
+    mediaType: d.mediaType,
+    text: d.text,
+    data: d.data,
+  }))
 }
 
 function readImages() {
@@ -1206,7 +1378,8 @@ async function sendNow() {
   const input = $("input")
   const text = input.value.trim()
   const hasImages = pendingImages.length > 0
-  if (!text && !hasImages) return
+  const hasDocs = pendingDocs.length > 0
+  if (!text && !hasImages && !hasDocs) return
   hideSlash()
   // Slash commands run client-side and never reach the server.
   if (text.startsWith("/")) {
@@ -1231,15 +1404,47 @@ async function sendNow() {
       return
     }
   }
+  // Documents are read on attach; if the last one is still in flight, wait
+  // for it (extraction is fast, 30 s is far beyond any real case).
+  if (hasDocs) {
+    const t0 = Date.now()
+    while (pendingDocs.some((d) => d.busy) && Date.now() - t0 < 30_000) {
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    if (pendingDocs.some((d) => d.busy)) {
+      toast("a document is still being read — one moment, then send again", "err")
+      return
+    }
+  }
+  const docsWire = hasDocs ? readDocs() : undefined
+  const docsView = hasDocs
+    ? pendingDocs.map((d) => ({
+        name: d.name,
+        mediaType: d.mediaType,
+        hasText: d.text !== undefined,
+        kind: d.kind,
+      }))
+    : undefined
+  // hsnr / local cannot read PDF bytes; when extraction found no text, say
+  // so now instead of failing after the request round-trip (the server
+  // enforces the same rule — this is just faster feedback).
+  if (
+    (sessionKind === "local" || sessionKind === "hsnr") &&
+    pendingDocs.some((d) => d.mediaType === "application/pdf" && d.text === undefined)
+  ) {
+    toast(
+      "This model cannot read the PDF directly and no text could be extracted from it — export the document as .docx or plain text instead",
+      "err",
+    )
+    return
+  }
   input.value = ""
   input.style.height = "auto"
-  clearImages()
-  userMsg(
-    text,
-    images ? images.map((im) => ({ url: `data:${im.mediaType};base64,${im.data}`, name: "" })) : undefined,
-  )
   setBusy(true)
-  const body = { text, images }
+  const body = { text, images, docs: docsWire }
+  const viewImages = images
+    ? images.map((im) => ({ url: `data:${im.mediaType};base64,${im.data}`, name: "" }))
+    : undefined
   let res = await postMessage(body)
   // A 404 (session gone, e.g. after a server restart) or a network-level
   // failure (null) both mean "this session is stale". If the server is
@@ -1250,13 +1455,14 @@ async function sendNow() {
     if (alive) {
       setBusy(false)
       if (await newSession()) {
-        userMsg(text, images ? images.map((im) => ({ url: `data:${im.mediaType};base64,${im.data}`, name: "" })) : undefined)
         setBusy(true)
         res = await postMessage(body)
       }
     }
   }
   if (!res) {
+    // Keep the composer text — nothing was sent.
+    input.value = text
     errorLine(
       "Could not reach the anvil server — is it running? Start it (EXE or `anvil server`) and reload this page.",
     )
@@ -1266,10 +1472,16 @@ async function sendNow() {
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
+    // Keep the composer text and the attachments so the user can fix the
+    // problem and resend (e.g. a PDF the model cannot read).
+    input.value = text
     errorLine(err.error ?? `request failed (HTTP ${res.status})`)
     setStatus("error", "error")
     setBusy(false)
+    return
   }
+  userMsg(text, viewImages, docsView)
+  clearAttachments()
 }
 
 async function abortTurn() {
@@ -1364,13 +1576,13 @@ function wireComposer() {
       sendNow()
     }
   })
-  // Pasted images (from clipboard) land in the composer.
+  // Pasted files (from clipboard) land in the composer.
   input.addEventListener("paste", (e) => {
     const items = e.clipboardData ? [...e.clipboardData.items] : []
     const files = items.filter((i) => i.kind === "file").map((i) => i.getAsFile()).filter(Boolean)
     if (files.length) {
       e.preventDefault()
-      addImageFiles(files)
+      addFiles(files)
     }
   })
 
@@ -1380,10 +1592,10 @@ function wireComposer() {
     if (e.target.value) setModel(e.target.value)
   })
 
-  // Image attachment: file picker, drag & drop onto the composer.
+  // File attachment (images + documents): picker, drag & drop onto composer.
   $("attach-btn").addEventListener("click", () => $("img-input").click())
   $("img-input").addEventListener("change", (e) => {
-    addImageFiles([...(e.target.files ?? [])])
+    addFiles([...(e.target.files ?? [])])
     e.target.value = ""
   })
   const composer = $("composer")
@@ -1396,7 +1608,7 @@ function wireComposer() {
     e.preventDefault()
     composer.classList.remove("drag")
     if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-      addImageFiles([...e.dataTransfer.files])
+      addFiles([...e.dataTransfer.files])
     }
   })
 }
@@ -1507,6 +1719,11 @@ function buildExportMd(s, entries) {
       for (const im of e.images ?? []) {
         L.push(`_image attached: ${im.mediaType} (${Math.round((im.data?.length ?? 0) / 1024)} KB — omitted from export)_`)
       }
+      for (const d of e.docs ?? []) {
+        L.push(
+          `_document attached: ${d.name} (${d.mediaType})${d.hasText ? " — text inlined into the model request" : d.mediaType === "application/pdf" ? " — PDF sent to the model (binary omitted from export)" : " — binary, omitted from export"}_`,
+        )
+      }
     } else if (e.role === "assistant") {
       L.push("", "## anvil", "", e.text)
     } else if (e.role === "tool") {
@@ -1526,6 +1743,10 @@ function buildExportHtml(s, entries) {
     if (e.role === "user") {
       body.push(`<section class="msg user"><div class="who">you</div>${e.text ? `<div class="user-text">${renderMarkdown(e.text)}</div>` : ""}`)
       for (const im of e.images ?? []) body.push(`<img src="data:${im.mediaType};base64,${im.data}" alt="attached image">`)
+      for (const d of e.docs ?? [])
+        body.push(
+          `<div class="user-doc">${escapeHtml(`document attached: ${d.name} (${d.mediaType})${d.hasText ? " — text inlined" : d.mediaType === "application/pdf" ? " — PDF sent to the model" : " — binary, omitted"}`)}</div>`,
+        )
       body.push("</section>")
     } else if (e.role === "assistant") {
       body.push(`<section class="msg assistant"><div class="who">anvil</div>${renderMarkdown(e.text) || ""}</section>`)
@@ -1552,6 +1773,7 @@ h1{font-size:26px;line-height:1.25}
 .who{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:26px 0 6px}
 .msg.user .user-text{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 14px}
 .msg.user img{max-width:240px;border-radius:8px;margin:6px 6px 0 0}
+.user-doc{margin-top:6px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--muted)}
 pre{background:var(--code);color:var(--code-fg);padding:12px 14px;border-radius:9px;overflow-x:auto;font-size:12.8px;line-height:1.55;font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 p>code,li>code{font-family:ui-monospace,Consolas,monospace;background:var(--card);border:1px solid var(--border);padding:1px 5px;border-radius:5px;font-size:.92em}
 .tool{border:1px solid var(--border);border-radius:9px;padding:10px 12px;margin:10px 0;font-size:13px}
