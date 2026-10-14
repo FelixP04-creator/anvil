@@ -4,6 +4,8 @@ dist/
 *.log
 
 package-lock.json
+# (the mobile/ subproject keeps its own lockfile for reproducible CI builds)
+!mobile/package-lock.json
 
 # build artifacts (SEA intermediates + release binaries — uploaded to
 # GitHub Releases instead of being committed)
