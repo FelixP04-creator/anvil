@@ -1223,36 +1223,31 @@ async function sendNow() {
   )
   setBusy(true)
   const body = { text, images }
-  const res = await postMessage(body)
+  let res = await postMessage(body)
+  // A 404 (session gone, e.g. after a server restart) or a network-level
+  // failure (null) both mean "this session is stale". If the server is
+  // alive, start a fresh session and retry the message once.
+  if (!res || res.status === 404) {
+    const alive =
+      res !== null || (await fetch("/api/health").then((r) => r.ok).catch(() => false))
+    if (alive) {
+      setBusy(false)
+      if (await newSession()) {
+        userMsg(text, images ? images.map((im) => ({ url: `data:${im.mediaType};base64,${im.data}`, name: "" })) : undefined)
+        setBusy(true)
+        res = await postMessage(body)
+      }
+    }
+  }
   if (!res) {
-    errorLine("Could not reach the anvil server")
+    errorLine(
+      "Could not reach the anvil server — is it running? Start it (EXE or `anvil server`) and reload this page.",
+    )
     setStatus("error", "error")
     setBusy(false)
     return
   }
   if (!res.ok) {
-    if (res.status === 404) {
-      // The session no longer exists on the server (e.g. after a restart).
-      // Start fresh and retry the message once.
-      setBusy(false)
-      if (!(await newSession())) return
-      userMsg(text, images ? images.map((im) => ({ url: `data:${im.mediaType};base64,${im.data}`, name: "" })) : undefined)
-      setBusy(true)
-      const retry = await postMessage(body)
-      if (!retry) {
-        errorLine("Could not reach the anvil server")
-        setStatus("error", "error")
-        setBusy(false)
-        return
-      }
-      if (!retry.ok) {
-        const err = await retry.json().catch(() => ({}))
-        errorLine(err.error ?? `request failed (HTTP ${retry.status})`)
-        setStatus("error", "error")
-        setBusy(false)
-      }
-      return
-    }
     const err = await res.json().catch(() => ({}))
     errorLine(err.error ?? `request failed (HTTP ${res.status})`)
     setStatus("error", "error")
