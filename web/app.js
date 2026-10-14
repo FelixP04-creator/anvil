@@ -15,6 +15,7 @@ let sessionId = null
 let source = null
 let busy = false
 let sseWasDown = false
+let lastSseEventAt = Date.now() // watch for silent streams (see watchdog below)
 
 let streamEl = null // .msg-text element currently receiving deltas
 let streamWrap = null // its .msg.assistant wrapper (for the fork button)
@@ -885,9 +886,39 @@ async function rebuildTranscript() {
   }
 }
 
+// Watchdog: the SSE connection can stay nominally "open" while a model call
+// drags on (or individual events are lost in transit). The UI would then sit
+// on "thinking…" forever, even though the server finished the turn. So while
+// a turn is running, a silent stream triggers a state poll — and if the
+// server says the turn is over, we rebuild the view from the transcript.
+let resyncing = false
+setInterval(() => {
+  if (!sessionId || !busy || resyncing) return
+  if (permCards.size) return // waiting on a permission decision, not the model
+  const idleS = Math.round((Date.now() - lastSseEventAt) / 1000)
+  if (idleS >= 10) {
+    // Visible liveness: the status bar shows how long we are waiting.
+    setStatus("working", `working… (${idleS} s)`)
+  }
+  if (idleS < 20) return
+  resyncing = true
+  fetch(`/api/sessions/${sessionId}`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((s) => {
+      // Re-sync only if the turn is over server-side but the UI still shows
+      // it as running (its turn_end event never made it through).
+      if (s && !s.busy && busy) rebuildTranscript()
+    })
+    .catch(() => {})
+    .finally(() => {
+      resyncing = false
+    })
+}, 5000)
+
 // ---------------------------------------------------------------- events
 
 function handle(ev) {
+  lastSseEventAt = Date.now()
   switch (ev.type) {
     case "assistant_delta":
       onDelta(ev.text ?? "")

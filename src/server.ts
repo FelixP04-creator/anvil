@@ -251,11 +251,17 @@ export class Session {
   }
 
   broadcast(e: ServerEvent): void {
+    if (process.env.ANVIL_SSE_DEBUG) {
+      console.error(`[sse:${this.id.slice(0, 8)}] broadcast ${e.type} → ${this.listeners.size} listener(s)`)
+    }
     for (const fn of this.listeners) {
       try {
         fn(e)
-      } catch {
+      } catch (err) {
         // A failing subscriber must not kill the running turn.
+        if (process.env.ANVIL_SSE_DEBUG) {
+          console.error(`[sse:${this.id.slice(0, 8)}] subscriber error on ${e.type}: ${String(err).slice(0, 160)}`)
+        }
       }
     }
   }
@@ -987,10 +993,33 @@ export class AnvilServer {
 
   /** SSE stream of all session events; subscribes before responding to avoid races. */
   private handleEvents(req: IncomingMessage, res: ServerResponse, session: Session): void {
+    const dbg = (m: string) => {
+      if (process.env.ANVIL_SSE_DEBUG) console.error(`[sse:${session.id.slice(0, 8)}] ${m}`)
+    }
     const unsubscribe = session.subscribe((e) => {
-      if (!res.writableEnded) res.write(sse(e))
+      if (!res.writableEnded) {
+        const ok = res.write(sse(e))
+        dbg(`write ${e.type} ok=${ok} ended=${res.writableEnded} destroyed=${res.destroyed}`)
+      } else {
+        dbg(`DROP ${e.type} (writableEnded)`)
+      }
     })
-    req.on("close", unsubscribe)
+    // Comment-line heartbeat: keeps idle-connection killers (routers, proxies,
+    // NATs) from resetting a long-lived stream and surfaces dead sockets.
+    // EventSource clients ignore ":" comment lines per spec.
+    const heartbeat = setInterval(() => {
+      if (!res.writableEnded) res.write(": hb\n\n")
+    }, 15000)
+    req.on("close", () => {
+      clearInterval(heartbeat)
+      dbg("req close → unsubscribe")
+      unsubscribe()
+    })
+    res.on("error", (err) => dbg(`res error: ${String(err).slice(0, 160)}`))
+    res.on("close", () => {
+      clearInterval(heartbeat)
+      dbg("res close")
+    })
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache, no-transform",
@@ -999,6 +1028,7 @@ export class AnvilServer {
     res.write("retry: 2000\n\n")
     // State snapshot so (re)connecting clients can re-sync.
     res.write(sse({ type: "session", ...session.state() }))
+    dbg("subscribed, snapshot sent")
   }
 
   private serveStatic(res: ServerResponse, urlPath: string): void {
