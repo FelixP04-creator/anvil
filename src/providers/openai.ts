@@ -9,6 +9,7 @@ import {
   CONNECT_TIMEOUT_MS,
   FIRST_CHUNK_TIMEOUT_MS,
   IDLE_TIMEOUT_MS,
+  LOCAL_CONNECT_TIMEOUT_MS,
   connectSignal,
   withTimeout,
 } from "./timeouts.ts"
@@ -111,11 +112,20 @@ export class OpenAIProvider implements Provider {
   baseUrl: string
   /** Gateways where every model takes reasoning_effort (e.g. hsnr). */
   forceReasoning: boolean
+  /** Connect phase budget — local runtimes may need minutes to load a
+   *  model's weights on first use. */
+  connectTimeoutMs: number
 
-  constructor(apiKey: string, baseUrl = "https://api.openai.com/v1", forceReasoning = false) {
+  constructor(
+    apiKey: string,
+    baseUrl = "https://api.openai.com/v1",
+    forceReasoning = false,
+    connectTimeoutMs = CONNECT_TIMEOUT_MS,
+  ) {
     this.apiKey = apiKey
     this.baseUrl = baseUrl
     this.forceReasoning = forceReasoning
+    this.connectTimeoutMs = connectTimeoutMs
   }
 
   async complete(
@@ -150,7 +160,7 @@ export class OpenAIProvider implements Provider {
     }
     if (effort) body.reasoning_effort = effort
 
-    const conn = connectSignal(signal, CONNECT_TIMEOUT_MS)
+    const conn = connectSignal(signal, this.connectTimeoutMs)
     let res: Response
     try {
       res = await fetch(`${this.baseUrl}/chat/completions`, {
@@ -164,7 +174,12 @@ export class OpenAIProvider implements Provider {
       })
     } catch (err) {
       if (conn.timedOut())
-        throw new Error(`OpenAI API: connection timed out after ${CONNECT_TIMEOUT_MS / 1000}s`)
+        throw new Error(
+          `OpenAI API: connection timed out after ${Math.round(this.connectTimeoutMs / 1000)}s` +
+            (this.connectTimeoutMs > CONNECT_TIMEOUT_MS
+              ? " (local model — first use may take a long time while the runtime loads the weights)"
+              : ""),
+        )
       throw err
     } finally {
       conn.stop()
@@ -199,9 +214,17 @@ export class OpenAIProvider implements Provider {
         text += delta.content
         onDelta(delta.content)
       }
-      if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
-        thought += delta.reasoning_content
-        onThinking?.(delta.reasoning_content)
+      // OpenAI-compatible runtimes disagree on the reasoning field name:
+      // OpenAI/deepseek use "reasoning_content", Ollama uses "reasoning".
+      const reasoning =
+        typeof delta.reasoning_content === "string"
+          ? delta.reasoning_content
+          : typeof delta.reasoning === "string"
+            ? delta.reasoning
+            : ""
+      if (reasoning.length > 0) {
+        thought += reasoning
+        onThinking?.(reasoning)
       }
       for (const tc of delta.tool_calls ?? []) {
         const acc = toolCalls.get(tc.index) ?? { id: "", name: "", args: "" }

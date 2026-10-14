@@ -5,6 +5,10 @@
 
 /** Give up establishing the connection after this long. */
 export const CONNECT_TIMEOUT_MS = 30_000
+/** Local runtimes (Ollama / LM Studio): the first request to a model that
+ *  is not loaded yet blocks until the weights are read from disk — 7 GB
+ *  models can take minutes, so allow a long connect phase for those. */
+export const LOCAL_CONNECT_TIMEOUT_MS = 300_000
 /** Grace period for the first chunk (long prefills under GPU load). */
 export const FIRST_CHUNK_TIMEOUT_MS = 180_000
 /** Grace period between subsequent chunks once streaming has started. */

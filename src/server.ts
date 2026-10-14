@@ -147,7 +147,7 @@ export class Session {
   >()
   private permissionCounter = 0
   private tools: Tool[]
-  private provider: Provider
+  provider: Provider
   private system: string
   private maxTurns: number
   private abortController: AbortController | null = null
@@ -156,13 +156,16 @@ export class Session {
    *  history yet (the turn is suspended between tool calls). */
   private completedTools: { ok: boolean; output: string }[] = []
 
-  constructor(id: string, config: ServerConfig, mode: PermissionMode, overrides?: { model?: string; thinking?: ThinkingEffort }) {
+  constructor(id: string, config: ServerConfig, mode: PermissionMode, overrides?: { model?: string; thinking?: ThinkingEffort; kind?: ProviderKind; provider?: Provider }) {
     this.id = id
     this.cwd = config.cwd
-    this.kind = config.kind
+    // kind/provider may come from a different (persisted or parent) session
+    // context than the global config — e.g. an old local session after the
+    // user switched the provider back to the gateway.
+    this.kind = overrides?.kind ?? config.kind
     this.model = overrides?.model || config.model
     this.thinking = overrides?.thinking ?? config.thinking
-    this.provider = config.provider
+    this.provider = overrides?.provider ?? config.provider
     this.maxTurns = config.maxTurns ?? 50
     this.ctx = { cwd: config.cwd, todos: [] }
     this.history = []
@@ -572,9 +575,31 @@ export class AnvilServer {
   private async adoptStored(id: string): Promise<Session | null> {
     const stored = await loadSession(id).catch(() => null)
     if (!stored) return null
+    // A session remembers the provider kind it was created with — its model
+    // names belong to that provider. When the global config has moved on
+    // (provider switched, server restarted), rebuild the matching provider
+    // instead of silently re-homing the session onto the current one.
+    let kind: ProviderKind = this.config.kind
+    let provider = this.config.provider
+    if (stored.kind !== this.config.kind) {
+      try {
+        const s = await resolveSettings({
+          provider: stored.kind,
+          model: stored.model,
+          thinking: stored.thinking,
+        })
+        kind = s.kind
+        provider = s.provider
+      } catch {
+        // The old provider is no longer usable (key removed, local runtime
+        // stopped) — fall back to the current config.
+      }
+    }
     const session = new Session(stored.id, this.config, stored.mode, {
       model: stored.model,
       thinking: stored.thinking,
+      kind,
+      provider,
     })
     session.history = stored.history
     session.ctx = { cwd: stored.cwd, todos: stored.todos }
@@ -953,6 +978,8 @@ export class AnvilServer {
           const fork = new Session(randomUUID(), this.config, session.engine.mode, {
             model: session.model,
             thinking: session.thinking,
+            kind: session.kind,
+            provider: session.provider,
           })
           fork.history = structuredClone(session.history.slice(0, cut + 1))
           fork.ctx.todos = structuredClone(session.ctx.todos)

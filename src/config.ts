@@ -19,6 +19,7 @@ import {
   defaultModelFor,
   HSNR_DEFAULT_BASE_URL,
   LOCAL_DUMMY_KEY,
+  makeLocalProvider,
 } from "./providers/index.ts"
 import { detectLocal, localCandidatesForError } from "./local.ts"
 import { AnthropicProvider } from "./providers/anthropic.ts"
@@ -188,5 +189,5 @@ export async function resolveSettings(ov: SettingsOverride = {}): Promise<Resolv
 }
 
 function localProvider(baseUrl: string): Provider {
-  return new OpenAIProvider(LOCAL_DUMMY_KEY, baseUrl)
+  return makeLocalProvider(baseUrl)
 }

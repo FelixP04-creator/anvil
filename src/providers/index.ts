@@ -4,6 +4,7 @@
 import type { Provider } from "../types.ts"
 import { AnthropicProvider } from "./anthropic.ts"
 import { OpenAIProvider } from "./openai.ts"
+import { LOCAL_CONNECT_TIMEOUT_MS } from "./timeouts.ts"
 
 export type ProviderKind = "anthropic" | "openai" | "hsnr" | "local"
 
@@ -38,6 +39,18 @@ export function defaultModelFor(kind: ProviderKind): string {
 export function makeProvider(kind: ProviderKind, apiKey: string, baseUrl?: string): Provider {
   if (kind === "anthropic") return new AnthropicProvider(apiKey)
   if (kind === "hsnr") return new OpenAIProvider(apiKey, baseUrl || HSNR_DEFAULT_BASE_URL, true)
-  if (kind === "local") return new OpenAIProvider(apiKey || LOCAL_DUMMY_KEY, baseUrl || LOCAL_DEFAULT_BASE_URL)
+  if (kind === "local") return makeLocalProvider(baseUrl)
   return new OpenAIProvider(apiKey, baseUrl || "https://api.openai.com/v1")
+}
+
+/** Local runtimes (Ollama / LM Studio) may take minutes on the first
+ *  request to load a model's weights — give the connect phase a long
+ *  budget instead of failing after the default 30 s. */
+export function makeLocalProvider(baseUrl?: string): Provider {
+  return new OpenAIProvider(
+    LOCAL_DUMMY_KEY,
+    baseUrl || LOCAL_DEFAULT_BASE_URL,
+    false,
+    LOCAL_CONNECT_TIMEOUT_MS,
+  )
 }

@@ -1,6 +1,6 @@
 {
   "name": "anvil-code",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "An open-source coding agent that lives in your terminal",
   "type": "module",
   "license": "MIT",

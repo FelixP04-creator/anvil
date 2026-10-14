@@ -122,6 +122,11 @@ async function loadModel() {
       },
     })
     localStorage.setItem(KEYS.model, model.id)
+    // Success path: clear the loading flag (the catch path below does this
+    // for failures). Forgetting this left `loading` true forever, which made
+    // send() silently refuse every message after a successful load.
+    loading = false
+    $("lc-load").disabled = false
     enterChat()
   } catch (err) {
     const msg = err?.message || String(err)

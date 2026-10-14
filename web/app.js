@@ -610,13 +610,19 @@ function renderTodos(todos) {
 function setModelPill(s) {
   const sel = $("model")
   const m = s.model ?? ""
-  const known =
-    s.kind === "local"
-      ? (localRuntime?.ok ? MODEL_SUGGESTIONS.local : [])
-      : MODEL_SUGGESTIONS[s.kind] ?? []
+  const isLocal = s.kind === "local"
+  const known = isLocal
+    ? (localRuntime?.ok ? MODEL_SUGGESTIONS.local : [])
+    : MODEL_SUGGESTIONS[s.kind] ?? []
   const opts = [m, ...known].filter((v, i, a) => v && a.indexOf(v) === i)
   sel.innerHTML = ""
-  for (const o of opts) sel.appendChild(el("option", null, o))
+  for (const o of opts) {
+    // Local models get a visible "(local)" label so they are distinguishable
+    // from gateway models; the option VALUE stays the raw model id.
+    const opt = el("option", null, isLocal ? `${o} (local)` : o)
+    opt.value = o
+    sel.appendChild(opt)
+  }
   sel.value = m
   sel.title =
     s.thinking && s.thinking !== "off"
@@ -1191,7 +1197,12 @@ async function postMessage(body) {
 }
 
 async function sendNow() {
-  if (busy) return
+  if (busy) {
+    // Never drop a message silently — the user would think the app is dead.
+    // Keep the text in the composer and say what is going on.
+    toast("anvil is still working on the previous message — wait a moment, or press Stop (Esc) first", "err")
+    return
+  }
   const input = $("input")
   const text = input.value.trim()
   const hasImages = pendingImages.length > 0
@@ -1775,6 +1786,9 @@ async function fetchLocalModels() {
     const res = await fetch("/api/local-models", { cache: "no-store" })
     if (!res.ok) throw new Error(String(res.status))
     localRuntime = await res.json()
+    // Keep the suggestion list in sync so the model dropdown in a local
+    // session offers every runtime model — not only the current one.
+    if (localRuntime.ok && Array.isArray(localRuntime.models)) MODEL_SUGGESTIONS.local = localRuntime.models
   } catch (err) {
     localRuntime = { ok: false, error: String(err).slice(0, 120) }
   }
