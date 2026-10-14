@@ -27,10 +27,13 @@ done — with a permission system that keeps you in control.
   the model is retried instead of failing the turn. Provider calls are
   guarded by timeouts (connection, first token, and stream idle), so a stalled
   model call surfaces an error instead of hanging the session forever.
-- **Three providers** — Anthropic Messages API, any OpenAI-compatible
-  endpoint (`OPENAI_BASE_URL`), and the HSNR gateway (`ai.ide3.de`, models
-  `Qwen/Qwen3.8-27B`, `zai-org/GLM-5.3`, `ultrabrain`, `smallbrain`), selected
-  by `--provider`, the settings dialog, or by which API key is set.
+- **Four providers** — Anthropic Messages API, any OpenAI-compatible
+  endpoint (`OPENAI_BASE_URL`), the HSNR gateway (`ai.ide3.de`, models
+  `Qwen/Qwen3.8-27B`, `zai-org/GLM-5.3`, `ultrabrain`, `smallbrain`), and
+  **local runtimes** (Ollama / LM Studio auto-detected on
+  `127.0.0.1:11434` / `127.0.0.1:1234` — no API key), selected by
+  `--provider`, the settings dialog, or by which API key is set; with no key
+  anywhere, a running local runtime is the out-of-the-box fallback.
 - **Model & thinking settings** — choose the model and an extended-thinking
   effort (`off` / `low` / `medium` / `high`) in the web UI settings dialog,
   via `anvil config`, a CLI flag, or environment variables. In the web UI the
@@ -67,6 +70,16 @@ done — with a permission system that keeps you in control.
   browser notifications for permission prompts and finished turns (when the
   tab is hidden), and one-click export of the conversation as Markdown or a
   self-contained HTML file. The layout is touch-friendly on phones.
+- **Offline model in the browser** — a self-contained page (the “Offline
+  model” button in the web UI, `/local-chat.html`) runs a small language
+  model *entirely on the device* via WebGPU: one-time weight download
+  (Qwen2-0.5B ≈ 350 MB, Llama-3.2-1B ≈ 750 MB, Llama-3.2-3B ≈ 1.7 GB), then
+  chat with zero internet and zero API keys. Chat only — no tools, no file
+  access.
+- **Apps** — a self-contained Windows EXE (CLI + web server in one
+  ~95 MB binary, no Node install) and Android/iOS apps that window the
+  server UI over your LAN plus the offline model — all downloadable from the
+  [releases](https://github.com/FelixP04-creator/anvil/releases).
 - **Sessions that survive** — web sessions and CLI conversations are stored
   as JSON next to the config file. The web UI reloads them after a server
   restart; the CLI resumes them with `anvil -c` (most recent) or
@@ -189,7 +202,8 @@ node scripts/demo-server.ts        # prints a ready-made session URL
 | --- | --- | --- |
 | `GET` | `/api/health` | liveness + version |
 | `GET` | `/api/config` | current settings; API keys masked, never raw |
-| `PUT` | `/api/config` | update `provider`, `model`, `thinking`, `anthropicKey`, `openaiKey`, `openaiBaseUrl` (empty string clears a field); persisted to `~/.anvil.json` |
+| `PUT` | `/api/config` | update `provider` (`anthropic` / `openai` / `hsnr` / `local`), `model`, `thinking`, `anthropicKey`, `openaiKey`, `openaiBaseUrl`, `hsnrKey`, `hsnrBaseUrl`, `localBaseUrl` (empty string clears a field); persisted to `~/.anvil.json` |
+| `GET` | `/api/local-models` | probe the local runtime (Ollama / LM Studio / `localBaseUrl`), list its models |
 | `POST` | `/api/sessions` | create a session (`{ "mode", "model", "thinking" }`, all optional) |
 | `GET` | `/api/sessions` | list sessions, merged from memory + disk (auto title, mode, busy, turns, usage, permission-pending) |
 | `GET` | `/api/sessions/:id` | state: title, model, thinking, mode, busy, todos, usage, turns, `msgCount`, `forkedFrom`, last-turn changes, pending permission |
@@ -209,6 +223,101 @@ SSE events: `session`, `assistant_delta`, `assistant_text` (carries a
 `turn_end` (per-turn usage + the turn's file changes + `msgCount`),
 `mode_changed`.
 
+## Local models (Ollama / LM Studio)
+
+anvil can run on a local LLM runtime — **no API key needed**. When no key is
+configured anywhere, anvil probes for a runtime and, if one is running,
+resolves the provider to `local` automatically:
+
+- Ollama at `http://127.0.0.1:11434`
+- LM Studio at `http://127.0.0.1:1234`
+
+```sh
+ollama serve        # or start LM Studio's local server
+anvil               # works out of the box — the first model from the
+                    # runtime's list is picked (override with --model)
+```
+
+Prefer an explicit setup (or a different OpenAI-compatible server)?
+
+```sh
+anvil config set provider local
+anvil config set local-base-url http://127.0.0.1:1234/v1
+# or per process:  ANVIL_LOCAL_BASE_URL=http://…:8080/v1
+```
+
+The web UI settings dialog shows the detected runtime, its base URL, and its
+model list (provider → “Local (Ollama / LM Studio)”). Local models force
+`thinking: off` — small local models don't do extended thinking reliably.
+
+## Offline model in the browser (WebGPU)
+
+The **“Offline model”** button in the web UI (or `http://<host>:<port>/local-chat.html`
+directly) runs a small language model **entirely in the browser** via
+WebGPU — no server call, no API key, and no internet after the first
+download (weights are cached in the browser's storage):
+
+| Model | Size | Sweet spot |
+| --- | --- | --- |
+| `Qwen2-0.5B-Instruct` | ≈ 350 MB | phones |
+| `Llama-3.2-1B-Instruct` | ≈ 750 MB | recommended |
+| `Llama-3.2-3B-Instruct` | ≈ 1.7 GB | laptops/desktops |
+
+Chat only — no tools, no file access, no terminal. It's a fast draft brain
+for quick questions, not the full agent. Needs a WebGPU-capable browser
+(Chrome/Edge 113+, Safari 16+, recent Firefox).
+
+## Desktop app (Windows EXE)
+
+The releases page ships `anvil-win-x64.exe` — a single self-contained binary
+(~95 MB, bundles the Node.js runtime) with the **CLI and the web server**:
+no Node install, no web folder, the UI is served from memory.
+
+```sh
+anvil-win-x64.exe server        # binds 0.0.0.0 by default (LAN-reachable)
+                                # and opens the browser
+anvil-win-x64.exe "fix the bug" # one-shot CLI, like the npm version
+```
+
+Build it yourself (Node ≥ 23.6, Windows):
+
+```sh
+node scripts/build-exe.mjs      # → release/anvil-win-x64.exe
+```
+
+Tip: the EXE is the easiest way to share anvil — run it on your PC, connect
+your phone to the same Wi-Fi, and use the mobile app (below) or just point
+the phone's browser at the printed `http://192.168.x.x:8787` URL.
+
+## Mobile apps (Android / iOS)
+
+From the releases page:
+
+- **`anvil-mobile-<version>-debug.apk`** — install directly on the phone
+  (allow “install unknown apps” for your file manager).
+- **`anvil-mobile-<version>-unsigned.ipa`** — sideload with [AltStore](https://altstore.io/)
+  or SideSync (a free Apple ID is enough; AltStore re-signs the unsigned
+  build for your device).
+
+The app has two tabs:
+
+- **Server** — the full anvil web UI from your computer over your LAN
+  (enter the address, e.g. `http://192.168.1.10:8787`; the last address is
+  remembered and auto-connected).
+- **Offline** — the WebGPU offline model running on the device itself.
+
+Build them yourself:
+
+```sh
+cd mobile
+npm install
+npm run build:android   # → mobile/android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Requirements: Android SDK + JDK 17–21 (JDK 25 is not supported by the
+template's Gradle yet). iOS needs a Mac: `npm run build:ios` then
+`xcodebuild` (see `.github/workflows/mobile.yml` for the exact CI recipe).
+
 ## Configuration
 
 Settings are resolved in this order (highest wins):
@@ -216,13 +325,16 @@ Settings are resolved in this order (highest wins):
 1. CLI flags / explicit API overrides
 2. environment variables
 3. the config file (`~/.anvil.json`, override the path with `$ANVIL_CONFIG`)
-4. built-in defaults (e.g. `claude-sonnet-4-5` / `gpt-4o`)
+4. built-in defaults (e.g. `claude-sonnet-4-5` / `gpt-4o`) — and, if no API
+   key exists anywhere, a running local runtime (Ollama / LM Studio) is
+   auto-detected and becomes provider `local`
 
 **Config file** — edited through `anvil config set <field> <value>` (also
 `unset`), the web UI settings dialog, or by hand. Fields: `provider`
-(`anthropic` | `openai` | `hsnr`), `model`, `thinking` (`off` | `low` |
-`medium` | `high`), `anthropicKey`, `openaiKey`, `openaiBaseUrl`, `hsnrKey`,
-`hsnrBaseUrl`. Keys are written with
+(`anthropic` | `openai` | `hsnr` | `local`), `model`, `thinking` (`off` |
+`low` | `medium` | `high`), `anthropicKey`, `openaiKey`, `openaiBaseUrl`,
+`hsnrKey`, `hsnrBaseUrl`, `localBaseUrl` (base URL of a custom
+OpenAI-compatible local runtime). Keys are written with
 mode `0600`; every API surface that displays them (CLI, `GET /api/config`,
 UI) shows them masked.
 
@@ -235,6 +347,8 @@ anvil config set openai-key sk-...
 anvil config set hsnr-key sk-...
 anvil config set model gpt-5
 anvil config set thinking high
+anvil config set provider local
+anvil config set local-base-url http://127.0.0.1:1234/v1
 anvil config unset openai-key
 anvil --thinking high "explain this architecture decision"
 ```
@@ -248,6 +362,7 @@ anvil --thinking high "explain this architecture decision"
 | `OWUI_API_KEY` | hsnr provider key |
 | `OPENAI_BASE_URL` | OpenAI-compatible gateway (default `https://api.openai.com/v1`) |
 | `HSNR_BASE_URL` | hsnr gateway (default `https://ai.ide3.de/openai`) |
+| `ANVIL_LOCAL_BASE_URL` | explicit base of a local OpenAI-compatible runtime (else Ollama / LM Studio are probed) |
 | `ANVIL_MODEL` / `OPENAI_MODEL` | default model per provider |
 | `ANVIL_CONFIG` | config file location (default `~/.anvil.json`) |
 | `ANVIL.md` (working dir) | project memory, loaded into the prompt |
@@ -270,9 +385,11 @@ src/
 ├── permissions.ts      permission modes + ask/always/deny rules
 ├── prompt.ts           original system prompts + environment detection
 ├── config.ts           settings: ~/.anvil.json, key/model/thinking resolution
+├── local.ts            Ollama / LM Studio auto-detection (probed, cached)
 ├── store.ts            session persistence (one JSON per session, $ANVIL_CONFIG aware)
 ├── diff.ts             dependency-free line diff (prefix/suffix strip + bounded LCS)
 ├── memory.ts           ANVIL.md loading (project + user)
+├── web-assets.ts       embedded web UI (base64) for the SEA single-file exe
 ├── types.ts            shared types (Tool, Provider, messages, thinking, images)
 ├── providers/
 │   ├── index.ts        provider kinds + defaults
@@ -289,9 +406,15 @@ web/
 ├── index.html  styles.css   dependency-free UI shell
 ├── app.js                ES module: live streaming markdown, file cards, images,
 │                         forking, slash commands, export, notifications, search
+├── local-chat.html       offline WebGPU model page (standalone, also embedded
+├── local-chat.js         in the mobile app): WebLLM engine, chat, persistence
 └── md.js                 isomorphic markdown + syntax highlight (browser + tests)
 scripts/
-└── demo-server.ts              web UI demo, no API key needed
+├── demo-server.ts              web UI demo, no API key needed
+├── build-exe.mjs               Windows EXE via Node SEA (esbuild bundle → postject)
+└── sync-mobile-web.mjs         copy the offline page into the mobile app shell
+mobile/                         Capacitor app shell (own package.json — the only
+                                subproject with a lockfile; android/ + ios/ checked in)
 test/
 ├── smoke.ts            agent loop, tools, permissions, diff, store, markdown (mock)
 └── server-smoke.ts     HTTP server: sessions, SSE, diffs, fork, images, persistence
@@ -362,6 +485,22 @@ at 100 000 cells; the emitted diff is capped at 600 rows (250 head + gap +
 ```sh
 node test/smoke.ts         # agent loop, tools, permissions (no network)
 node test/server-smoke.ts  # HTTP server: sessions, SSE, permission flow
+node scripts/build-exe.mjs # Windows EXE (Node SEA) → release/anvil-win-x64.exe
+```
+
+### Mobile app
+
+`mobile/` is a Capacitor subproject with its **own `package.json`** (and the
+only lockfile in the repo) — the root stays dependency- and lockfile-free.
+The app shell (`mobile/public/index.html`) is two iframes: the anvil server
+UI over the LAN and the offline WebGPU chat page, which
+`scripts/sync-mobile-web.mjs` copies from `web/` before each build.
+
+```sh
+cd mobile && npm install
+npm run build:android      # debug APK (JDK 17–21 + Android SDK)
+npm run build:ios          # sync only; the xcodebuild recipe lives in
+                           # .github/workflows/mobile.yml
 ```
 
 ### Publishing

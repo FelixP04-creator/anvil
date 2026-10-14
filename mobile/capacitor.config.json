@@ -1,0 +1,9 @@
+{
+  "appId": "de.felixp04.anvil",
+  "appName": "anvil",
+  "webDir": "public",
+  "backgroundColor": "#111418",
+  "server": {
+    "androidScheme": "http"
+  }
+}

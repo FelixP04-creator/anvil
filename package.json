@@ -1,6 +1,6 @@
 {
   "name": "anvil-code",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "An open-source coding agent that lives in your terminal",
   "type": "module",
   "license": "MIT",
@@ -24,6 +24,8 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6",
     "typescript": "^5.7.0"
   }
 }

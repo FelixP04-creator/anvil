@@ -2,10 +2,12 @@
 // anvil — an open-source coding agent for your terminal.
 
 import { randomUUID } from "node:crypto"
+import { networkInterfaces } from "node:os"
+import { spawn } from "node:child_process"
 
 import { runAgent, type AgentEvent, type AgentOptions } from "./agent.ts"
 import { PermissionEngine, type PermissionMode, formatCall } from "./permissions.ts"
-import { type ProviderKind } from "./providers/index.ts"
+import { type ProviderKind, PROVIDER_KINDS } from "./providers/index.ts"
 import {
   THINKING_LEVELS,
   configPath,
@@ -14,6 +16,7 @@ import {
   resolveSettings,
   saveConfig,
   type FileConfig,
+  type ResolvedSettings,
 } from "./config.ts"
 import { buildSubagentPrompt, buildSystemPrompt, detectEnv } from "./prompt.ts"
 import { loadMemory } from "./memory.ts"
@@ -38,8 +41,8 @@ usage:
   anvil config [command]           show or change persistent settings
 
 options:
-  --provider <kind>     anthropic | openai | hsnr (default: whichever API key is set)
-  --model <id>          model id (default: per-provider default, e.g. Qwen/Qwen3.8-27B for hsnr)
+  --provider <kind>     anthropic | openai | hsnr | local (default: first key found, then local runtime)
+  --model <id>          model id (default: per-provider default; for "local": first model of the runtime)
   --thinking <level>    off | low | medium | high (extended thinking, default: off)
   --mode <mode>         default | acceptEdits | plan | bypass (default: default)
   --max-turns <n>       agent turn limit (default: 50)
@@ -50,13 +53,16 @@ options:
 
 server options:
   --port <n>            port for "anvil server" (default: 8787)
+  --host <ip>           bind address (default: 127.0.0.1; use 0.0.0.0 to reach
+                        the UI from phones/tablets on your network)
+  --no-browser          do not open the web UI in a browser automatically
   --cwd <dir>           working directory for "anvil server" (default: current)
 
 config commands:
   anvil config                       show settings (keys masked)
   anvil config set <field> <value>   set provider | model | thinking |
                                      anthropic-key | openai-key | openai-base-url |
-                                     hsnr-key | hsnr-base-url
+                                     hsnr-key | hsnr-base-url | local-base-url
   anvil config unset <field>         remove a field
 
 settings are stored in ~/.anvil.json. Resolution order:
@@ -68,7 +74,9 @@ environment:
   OWUI_API_KEY          API key for the hsnr provider
   OPENAI_BASE_URL       OpenAI-compatible gateway base (default: https://api.openai.com/v1)
   HSNR_BASE_URL         hsnr gateway base (default: https://ai.ide3.de/openai)
-  ANVIL_MODEL           default model for the anthropic/hsnr provider
+  ANVIL_LOCAL_BASE_URL  OpenAI-compatible base of a local runtime (default:
+                        auto-detect Ollama 127.0.0.1:11434 / LM Studio 127.0.0.1:1234)
+  ANVIL_MODEL           default model for the anthropic/hsnr/local provider
   OPENAI_MODEL          default model for the openai provider
   ANVIL_CONFIG          config file location (default: ~/.anvil.json)`)
 }
@@ -82,6 +90,7 @@ const CONFIG_FIELDS = [
   "openai-base-url",
   "hsnr-key",
   "hsnr-base-url",
+  "local-base-url",
 ] as const
 type ConfigField = (typeof CONFIG_FIELDS)[number]
 
@@ -91,10 +100,11 @@ function fieldToKey(field: ConfigField): keyof FileConfig {
   if (field === "openai-base-url") return "openaiBaseUrl"
   if (field === "hsnr-key") return "hsnrKey"
   if (field === "hsnr-base-url") return "hsnrBaseUrl"
+  if (field === "local-base-url") return "localBaseUrl"
   return field
 }
 
-function runConfigCommand(args: string[]): void {
+async function runConfigCommand(args: string[]): Promise<void> {
   const [cmd, field, ...rest] = args
   if (!cmd || cmd === "show") {
     const file = loadConfig()
@@ -111,9 +121,10 @@ function runConfigCommand(args: string[]): void {
     line("openai-base-url", file.openaiBaseUrl, false)
     line("hsnr-key", file.hsnrKey, true)
     line("hsnr-base-url", file.hsnrBaseUrl, false)
+    line("local-base-url", file.localBaseUrl, false)
     console.log("")
     try {
-      const s = resolveSettings()
+      const s = await resolveSettings()
       console.log(`resolved:     ${s.kind} / ${s.model} / thinking: ${s.thinking}`)
     } catch (err) {
       console.log(`resolved:     ${String(err)}`)
@@ -138,11 +149,9 @@ function runConfigCommand(args: string[]): void {
     }
     if (
       field === "provider" &&
-      value !== "anthropic" &&
-      value !== "openai" &&
-      value !== "hsnr"
+      !PROVIDER_KINDS.includes(value as ProviderKind)
     ) {
-      console.error(`provider must be one of: anthropic | openai | hsnr`)
+      console.error(`provider must be one of: ${PROVIDER_KINDS.join(" | ")}`)
       process.exit(1)
     }
     if (field === "thinking" && !THINKING_LEVELS.includes(value as ThinkingEffort)) {
@@ -167,6 +176,9 @@ interface Args {
   maxTurns: number
   print: boolean
   port: number
+  host: string
+  hostExplicit: boolean
+  noBrowser: boolean
   cwd: string
   configArgs: string[]
   cont: boolean
@@ -184,6 +196,9 @@ function parseArgs(argv: string[]): Args {
   let maxTurns = 50
   let print = false
   let port = 8787
+  let host = "127.0.0.1"
+  let hostExplicit = false
+  let noBrowser = false
   let cwd = process.cwd()
   let cont = false
   let resume: string | null = null
@@ -202,6 +217,11 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--mode") mode = (argv[++i] as PermissionMode) ?? mode
     else if (a === "--max-turns") maxTurns = parseInt(argv[++i] ?? "50", 10) || 50
     else if (a === "--port") port = parseInt(argv[++i] ?? "8787", 10) || 8787
+    else if (a === "--host") {
+      host = argv[++i] ?? host
+      hostExplicit = true
+    }
+    else if (a === "--no-browser") noBrowser = true
     else if (a === "--cwd") cwd = argv[++i] ?? cwd
     else if (a === "-c" || a === "--continue") cont = true
     else if (a === "-r" || a === "--resume") resume = argv[++i] ?? null
@@ -211,7 +231,40 @@ function parseArgs(argv: string[]): Args {
       process.exit(0)
     } else parts.push(a)
   }
-  return { command, task: parts.join(" "), provider, model, thinking, mode, maxTurns, print, port, cwd, configArgs, cont, resume }
+  return { command, task: parts.join(" "), provider, model, thinking, mode, maxTurns, print, port, host, hostExplicit, noBrowser, cwd, configArgs, cont, resume }
+}
+
+/** True when running from the single-file exe (SEA bundle). */
+function isEmbedded(): boolean {
+  return Boolean((globalThis as { __ANVIL_EMBEDDED__?: boolean }).__ANVIL_EMBEDDED__)
+}
+
+/** First non-internal IPv4 address of this machine (for the "phone connects here" hint). */
+function lanIP(): string | null {
+  const ifaces = networkInterfaces()
+  for (const list of Object.values(ifaces)) {
+    for (const n of list ?? []) {
+      if (n.family === "IPv4" && !n.internal) return n.address
+    }
+  }
+  return null
+}
+
+/** Open the system browser; fire-and-forget (never throws). */
+function openBrowser(url: string): void {
+  const [cmd, args] =
+    process.platform === "win32"
+      ? ["cmd", ["/c", "start", "", url]]
+      : process.platform === "darwin"
+        ? ["open", [url]]
+        : ["xdg-open", [url]]
+  try {
+    const child = spawn(cmd, args, { stdio: "ignore", detached: true })
+    child.unref()
+    child.on("error", () => {})
+  } catch {
+    // no browser available — the URL is printed anyway
+  }
 }
 
 function ago(ts: number): string {
@@ -248,13 +301,17 @@ async function main(): Promise<void> {
     console.error(`error: unknown thinking level "${args.thinking}" (use: ${THINKING_LEVELS.join(", ")})`)
     process.exit(1)
   }
+  if (args.provider && !PROVIDER_KINDS.includes(args.provider)) {
+    console.error(`error: unknown provider "${args.provider}" (use: ${PROVIDER_KINDS.join(", ")})`)
+    process.exit(1)
+  }
 
   // One-time move of sessions stored by early v0.6.0 in the visible
   // <config dir>/anvil-sessions folder into the hidden .anvil/ location.
   await migrateLegacySessions()
 
   if (args.command === "config") {
-    runConfigCommand(args.configArgs)
+    await runConfigCommand(args.configArgs)
     return
   }
 
@@ -263,22 +320,52 @@ async function main(): Promise<void> {
     return
   }
 
-  const settings = resolveSettings({ provider: args.provider, model: args.model || undefined, thinking: args.thinking })
-  const { provider, kind, model, thinking } = settings
+  // The single-file exe (SEA bundle) is a "desktop app": bind to the LAN
+  // by default so phones/tablets can connect, and open the browser.
+  if (isEmbedded() && args.command === "server" && !args.hostExplicit) {
+    args.host = "0.0.0.0"
+  }
+
+  // The server may start without a resolvable provider (no keys, no local
+  // runtime yet): the user configures one in the web UI or with `anvil
+  // config set`, and session creation re-resolves on demand. The CLI chat
+  // needs settings up front, so only "server" tolerates the failure.
+  let settings: ResolvedSettings | null
+  try {
+    settings = await resolveSettings({ provider: args.provider, model: args.model || undefined, thinking: args.thinking })
+  } catch (err) {
+    if (args.command !== "server") throw err
+    settings = null
+  }
 
   if (args.command === "server") {
+    const s = settings
     const server = new AnvilServer(
-      { provider, kind, model, thinking, cwd: args.cwd },
-      settings,
+      s
+        ? { provider: s.provider, kind: s.kind, model: s.model, thinking: s.thinking, cwd: args.cwd }
+        : { kind: "local", model: "", thinking: "off", cwd: args.cwd },
+      s,
     )
-    const port = await server.listen(args.port)
-    console.log(`anvil server listening on http://localhost:${port}`)
-    console.log(`  web UI:  http://localhost:${port}`)
-    console.log(`  model:   ${model} (${kind}, thinking: ${thinking})`)
+    const port = await server.listen(args.port, args.host)
+    const url = `http://${args.host === "0.0.0.0" ? lanIP() || "localhost" : args.host}:${port}`
+    console.log(`anvil server listening on ${args.host === "0.0.0.0" ? `http://${lanIP() || "localhost"}:${port} (all interfaces)` : url}`)
+    console.log(`  web UI:  ${url}`)
+    if (args.host === "0.0.0.0") {
+      console.log(`  phones:  connect from your phone to ${url} (same network)`)
+    }
+    if (s) console.log(`  model:   ${s.model} (${s.kind}, thinking: ${s.thinking})`)
+    else console.log(`  model:   (none yet — configure a provider in the web UI or with anvil config set)`)
     console.log(`  cwd:     ${args.cwd}`)
     console.log(`  keys:    config file ${configPath()} or environment variables`)
+    if (!args.noBrowser) {
+      openBrowser(url)
+      console.log(`  browser: opened (disable with --no-browser)`)
+    }
     return
   }
+
+  // Non-server commands already threw above when nothing is resolvable.
+  const { provider, kind, model, thinking } = settings!
 
   const workCwd = process.cwd()
 

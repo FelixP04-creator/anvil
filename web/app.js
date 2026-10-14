@@ -609,7 +609,10 @@ function renderTodos(todos) {
 function setModelPill(s) {
   const sel = $("model")
   const m = s.model ?? ""
-  const known = MODEL_SUGGESTIONS[s.kind] ?? []
+  const known =
+    s.kind === "local"
+      ? (localRuntime?.ok ? MODEL_SUGGESTIONS.local : [])
+      : MODEL_SUGGESTIONS[s.kind] ?? []
   const opts = [m, ...known].filter((v, i, a) => v && a.indexOf(v) === i)
   sel.innerHTML = ""
   for (const o of opts) sel.appendChild(el("option", null, o))
@@ -618,6 +621,7 @@ function setModelPill(s) {
     s.thinking && s.thinking !== "off"
       ? `Model — thinking: ${s.thinking} (change applies from the next message)`
       : "Model — change applies from the next message"
+  if (s.kind === "local" && !localRuntime) fetchLocalModels().then(() => setModelPill(s))
 }
 
 function applyState(s) {
@@ -1692,6 +1696,31 @@ const MODEL_SUGGESTIONS = {
   anthropic: ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5", "claude-3-7-sonnet-latest"],
   openai: ["gpt-5", "gpt-5-mini", "gpt-4o", "o3", "o4-mini"],
   hsnr: ["Qwen/Qwen3.8-27B", "zai-org/GLM-5.3", "ultrabrain", "smallbrain"],
+  // Filled dynamically from /api/local-models (Ollama / LM Studio).
+  local: [],
+}
+
+// Last known local runtime (server-side probe of Ollama / LM Studio).
+let localRuntime = null // { ok, vendor, baseUrl, models, error }
+
+async function fetchLocalModels() {
+  try {
+    const res = await fetch("/api/local-models", { cache: "no-store" })
+    if (!res.ok) throw new Error(String(res.status))
+    localRuntime = await res.json()
+  } catch (err) {
+    localRuntime = { ok: false, error: String(err).slice(0, 120) }
+  }
+  const el = $("local-status")
+  if ($("set-provider").value === "local" && !$("settings").hidden) {
+    if (localRuntime.ok) {
+      el.textContent = `✓ ${localRuntime.models.length} model(s) via ${localRuntime.vendor} at ${localRuntime.baseUrl}`
+    } else {
+      el.textContent = `✗ ${localRuntime.error ?? "no local runtime found"} — start Ollama (ollama serve) or LM Studio, or set a base URL.`
+    }
+    el.hidden = false
+  }
+  return localRuntime
 }
 
 // Masked values shown when the modal opens; a key field is only sent back
@@ -1699,14 +1728,27 @@ const MODEL_SUGGESTIONS = {
 let settingsOrigins = {}
 
 function updateHsnrFields() {
-  const on = $("set-provider").value === "hsnr"
+  const p = $("set-provider").value
+  const on = p === "hsnr"
   $("hsnr-fields-key").hidden = !on
   $("hsnr-fields-base").hidden = !on
+  $("local-fields-base").hidden = p !== "local"
+  if (p !== "local") $("local-status").hidden = true
 }
 
 function fillModelSuggestions(provider) {
   const dl = $("model-options")
   dl.innerHTML = ""
+  if (provider === "local") {
+    // Fill from the detected runtime (fetch if unknown), plus whatever the
+    // runtime reported last time this page load saw it.
+    const rt = localRuntime
+    if (rt && rt.ok) MODEL_SUGGESTIONS.local = rt.models
+    else if (rt) MODEL_SUGGESTIONS.local = []
+    for (const m of MODEL_SUGGESTIONS.local) dl.appendChild(el("option", null, m))
+    if (!rt) fetchLocalModels().then((r) => fillModelSuggestions("local"))
+    return
+  }
   const list = MODEL_SUGGESTIONS[provider] ?? MODEL_SUGGESTIONS.anthropic
   for (const m of list) dl.appendChild(el("option", null, m))
 }
@@ -1726,10 +1768,12 @@ function openSettings() {
       $("set-openai-base").value = c.openaiBaseUrl ?? ""
       $("set-hsnr-key").value = c.hsnrKey ?? ""
       $("set-hsnr-base").value = c.hsnrBaseUrl ?? ""
+      $("set-local-base").value = c.localBaseUrl ?? ""
       $("set-model").value = c.model ?? ""
       $("set-thinking").value = c.thinking ?? "off"
       fillModelSuggestions(c.provider)
       updateHsnrFields()
+      if (c.provider === "local") fetchLocalModels()
       $("set-config-path").textContent = c.configPath ?? "~/.anvil.json"
       $("settings").hidden = false
       $("settings-backdrop").hidden = false
@@ -1756,6 +1800,7 @@ async function saveSettings() {
   if (ok !== settingsOrigins["set-openai-key"]) patch.openaiKey = ok
   if (hk !== settingsOrigins["set-hsnr-key"]) patch.hsnrKey = hk
   patch.hsnrBaseUrl = $("set-hsnr-base").value.trim()
+  patch.localBaseUrl = $("set-local-base").value.trim()
 
   const res = await fetch("/api/config", {
     method: "PUT",

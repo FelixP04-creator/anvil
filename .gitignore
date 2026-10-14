@@ -4,3 +4,8 @@ dist/
 *.log
 
 package-lock.json
+
+# build artifacts (SEA intermediates + release binaries — uploaded to
+# GitHub Releases instead of being committed)
+build/
+release/

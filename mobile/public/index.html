@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111418">
+  <title>anvil</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2' y='4' width='12' height='3' rx='1' fill='%23f0a840'/%3E%3Crect x='5.5' y='7' width='5' height='3' fill='%23f0a840'/%3E%3Crect x='3' y='10' width='10' height='3' rx='1.5' fill='%236ea8fe'/%3E%3C/svg%3E">
+  <style>
+    :root { --bg:#111418; --fg:#e6e9ee; --muted:#9aa4b2; --line:#262b33; --card:#181d24; --accent:#f0a840; }
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; flex-direction: column; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+    .top { flex: none; display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+    .top .logo { font-weight: 800; font-size: 15px; letter-spacing: .02em; }
+    .top .logo b { color: var(--accent); }
+    .tabs { margin-left: auto; display: flex; gap: 4px; background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 3px; }
+    .tabs button { border: none; background: transparent; color: var(--muted); font: inherit; font-size: 12.5px; font-weight: 600; padding: 5px 12px; border-radius: 6px; cursor: pointer; }
+    .tabs button.on { background: var(--accent); color: #14100a; }
+
+    #panel-server { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+    .conn { flex: none; display: flex; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+    .conn input { flex: 1; min-width: 0; background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font: inherit; font-size: 13px; outline: none; }
+    .conn input:focus { border-color: var(--accent); }
+    .conn button { background: var(--accent); color: #14100a; border: none; border-radius: 8px; font: inherit; font-weight: 700; font-size: 13px; padding: 0 14px; cursor: pointer; flex: none; }
+    .hint { flex: none; padding: 7px 12px; font-size: 11.5px; color: var(--muted); line-height: 1.45; border-bottom: 1px solid var(--line); }
+    .hint code { font-family: ui-monospace, monospace; font-size: 11px; background: rgba(0,0,0,.3); padding: 1px 4px; border-radius: 4px; }
+    .frame-wrap { flex: 1; min-height: 0; position: relative; }
+    .frame-wrap iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: none; background: var(--bg); }
+    .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; background: var(--bg); text-align: center; padding: 24px; }
+    .overlay .t { font-size: 15px; font-weight: 700; }
+    .overlay .s { font-size: 12.5px; color: var(--muted); line-height: 1.5; max-width: 380px; }
+    .overlay .s code { font-family: ui-monospace, monospace; font-size: 11.5px; color: var(--fg); }
+    .status { flex: none; font-size: 11px; color: var(--muted); padding: 4px 12px; border-top: 1px solid var(--line); }
+    .status.err { color: #ffb4a4; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header class="top">
+    <span class="logo">an<b>vil</b></span>
+    <nav class="tabs">
+      <button id="tab-server" class="on" type="button">Server</button>
+      <button id="tab-offline" type="button">Offline</button>
+    </nav>
+  </header>
+
+  <div id="panel-server">
+    <div class="conn">
+      <input id="url" type="url" inputmode="url" placeholder="http://192.168.1.10:8787" autocomplete="off" spellcheck="false">
+      <button id="connect" type="button">Connect</button>
+    </div>
+    <div class="hint">
+      Start <code>anvil server --host 0.0.0.0</code> on your computer (or the EXE) and connect this
+      phone to the same network. The full agent UI runs from your computer — this app is just a window into it.
+    </div>
+    <div class="frame-wrap">
+      <div class="overlay" id="server-overlay">
+        <div class="t">No server connected</div>
+        <div class="s">Enter the address of your anvil server above and hit <b>Connect</b> —<br>e.g. <code>http://192.168.1.10:8787</code></div>
+      </div>
+      <iframe id="server-frame" class="hidden" src="about:blank" referrerpolicy="no-referrer"></iframe>
+    </div>
+    <div class="status" id="server-status">not connected</div>
+  </div>
+
+  <div id="panel-offline" style="flex:1; display:none; min-height:0;">
+    <iframe id="offline-frame" src="/local-chat.html?embedded=1" referrerpolicy="no-referrer"
+      style="position:absolute; inset:0; width:100%; height:100%; border:none; background:var(--bg);"></iframe>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id)
+    const KEY = "anvil-mobile-server-url"
+
+    const input = $("url")
+    input.value = localStorage.getItem(KEY) || ""
+
+    // Tabs -------------------------------------------------------------
+    function showTab(which) {
+      const server = which === "server"
+      $("tab-server").classList.toggle("on", server)
+      $("tab-offline").classList.toggle("on", !server)
+      $("panel-server").style.display = server ? "flex" : "none"
+      const off = $("panel-offline")
+      off.style.display = server ? "none" : "flex"
+    }
+    $("tab-server").addEventListener("click", () => showTab("server"))
+    $("tab-offline").addEventListener("click", () => showTab("offline"))
+
+    // Server iframe ------------------------------------------------------
+    function normalizeUrl(raw) {
+      let u = (raw || "").trim()
+      if (!u) return null
+      if (!/^https?:\/\//i.test(u)) u = "http://" + u
+      try {
+        const parsed = new URL(u)
+        parsed.hash = ""
+        if (!parsed.pathname || parsed.pathname === "/") parsed.pathname = "/"
+        return parsed.toString()
+      } catch {
+        return null
+      }
+    }
+
+    function connect() {
+      const url = normalizeUrl(input.value)
+      if (!url) {
+        setStatus("enter a valid address, e.g. http://192.168.1.10:8787", true)
+        return
+      }
+      localStorage.setItem(KEY, url)
+      setStatus("connecting…")
+      const frame = $("server-frame")
+      frame.src = url
+      $("server-overlay").classList.add("hidden")
+      frame.classList.remove("hidden")
+    }
+
+    function setStatus(text, isErr) {
+      const el = $("server-status")
+      el.textContent = text
+      el.classList.toggle("err", Boolean(isErr))
+    }
+
+    $("connect").addEventListener("click", connect)
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") connect() })
+
+    // Iframe load events only tell us the navigation finished — for
+    // cross-origin frames we cannot read the status, so we just show the
+    // URL. A failed load surfaces as the browser's own error page.
+    $("server-frame").addEventListener("load", () => {
+      setStatus("connected to " + input.value.trim())
+    })
+
+    // Auto-reconnect to the last URL on app start.
+    if (input.value) connect()
+  </script>
+</body>
+</html>

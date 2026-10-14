@@ -81,6 +81,9 @@
           <button id="settings-btn" class="icon-btn" title="Settings (provider, keys, model, thinking)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.58 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.65 8.86a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.08A1.7 1.7 0 0 0 10.12 3V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.08a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51.88z"/></svg>
           </button>
+          <a id="offline-btn" class="icon-btn" href="/local-chat.html" title="Offline model — runs in your browser (WebGPU), no server or API key needed">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12M8 12l4 4 4-4"/><path d="M5 20h14"/></svg>
+          </a>
           <button id="copy-link" class="icon-btn" title="Copy session link">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M10 14a4 4 0 0 0 6 .4l3-3a4 4 0 0 0-5.6-5.6l-1.7 1.7"/><path d="M14 10a4 4 0 0 0-6-.4l-3 3a4 4 0 0 0 5.6 5.6l1.7-1.7"/></svg>
           </button>
@@ -151,10 +154,11 @@
       <label class="set-field">
         <span>Provider</span>
         <select id="set-provider">
-          <option value="">auto (first key found)</option>
+          <option value="">auto (first key found, then local runtime)</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai">OpenAI</option>
           <option value="hsnr">HSNR (ai.ide3.de)</option>
+          <option value="local">Local (Ollama / LM Studio)</option>
         </select>
       </label>
       <label class="set-field">
@@ -177,6 +181,11 @@
         <span>HSNR base URL (optional)</span>
         <input id="set-hsnr-base" type="text" placeholder="https://ai.ide3.de/openai" spellcheck="false">
       </label>
+      <label class="set-field" id="local-fields-base" hidden>
+        <span>Local base URL (optional)</span>
+        <input id="set-local-base" type="text" placeholder="auto: Ollama 127.0.0.1:11434 · LM Studio 127.0.0.1:1234" spellcheck="false">
+      </label>
+      <div class="set-note" id="local-status" hidden></div>
       <label class="set-field">
         <span>Model</span>
         <input id="set-model" type="text" list="model-options" placeholder="default for the provider" spellcheck="false">

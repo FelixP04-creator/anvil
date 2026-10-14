@@ -22,6 +22,8 @@ import { PermissionEngine, type AskAnswer, type AskFn, type PermissionMode } fro
 import { buildSubagentPrompt, buildSystemPrompt, detectEnv } from "./prompt.ts"
 import { loadMemory } from "./memory.ts"
 import { createMainTools, createSubagentTools } from "./tools/index.ts"
+import { detectLocal, localCandidatesForError } from "./local.ts"
+import { embeddedWeb } from "./web-assets.ts"
 import {
   THINKING_LEVELS,
   configPath,
@@ -44,8 +46,11 @@ import type {
   ToolResult,
 } from "./types.ts"
 
-/** Version from package.json — single source of truth (works from src/ and dist/). */
+/** Version: from the SEA bundle's injected global (exe), then package.json
+ *  (single source of truth — works from src/ and dist/). */
 export function version(): string {
+  const g = globalThis as { __ANVIL_VERSION__?: string }
+  if (typeof g.__ANVIL_VERSION__ === "string" && g.__ANVIL_VERSION__) return g.__ANVIL_VERSION__
   try {
     const here = dirname(fileURLToPath(import.meta.url))
     const raw = readFileSync(join(here, "..", "package.json"), "utf8")
@@ -60,7 +65,12 @@ export const MODES: PermissionMode[] = ["default", "acceptEdits", "plan", "bypas
 export const THINKING: ThinkingEffort[] = THINKING_LEVELS
 
 export interface ServerConfig {
-  provider: Provider
+  /**
+   * May be undefined when no provider could be resolved at startup (no keys,
+   * no local runtime). The server still runs — the web UI can configure one
+   * later (PUT /api/config) and session creation re-resolves on demand.
+   */
+  provider?: Provider
   kind: ProviderKind
   model: string
   thinking: ThinkingEffort
@@ -81,6 +91,7 @@ interface ConfigView {
   hsnrKey: string | null
   openaiBaseUrl: string | null
   hsnrBaseUrl: string | null
+  localBaseUrl: string | null
   configPath: string
 }
 
@@ -508,14 +519,15 @@ export class AnvilServer {
 
   constructor(config: ServerConfig, settings?: ResolvedSettings) {
     this.config = config
+    // When no settings are passed (mock/demo setup) they are resolved
+    // lazily in listen() — that can be async (local runtime detection).
+    this.settings = settings ?? null
+    let here = process.cwd()
     try {
-      this.settings = settings ?? resolveSettings()
+      here = dirname(fileURLToPath(import.meta.url))
     } catch {
-      // No keys resolvable (mock/demo setup) — settings still work via the
-      // config file once the user stores keys.
-      this.settings = settings ?? null
+      // embedded bundle without a resolvable module URL
     }
-    const here = dirname(fileURLToPath(import.meta.url))
     this.webRoot = normalize(join(here, "..", "web"))
   }
 
@@ -590,13 +602,28 @@ export class AnvilServer {
       hsnrKey: maskKey(hsnrKey),
       openaiBaseUrl: process.env.OPENAI_BASE_URL || file.openaiBaseUrl || null,
       hsnrBaseUrl: process.env.HSNR_BASE_URL || file.hsnrBaseUrl || null,
+      localBaseUrl: process.env.ANVIL_LOCAL_BASE_URL || file.localBaseUrl || null,
       configPath: configPath(),
     }
   }
 
-  /** Start listening; returns the actual port (pass 0 for an ephemeral one). */
-  async listen(port = 8787): Promise<number> {
+  /**
+   * Start listening; returns the actual port (pass 0 for an ephemeral one).
+   * `host` defaults to loopback — pass 0.0.0.0 (e.g. `anvil server
+   * --host 0.0.0.0`) to make the UI reachable from other devices on the
+   * network (phones, tablets). The API has no authentication; only bind
+   * to 0.0.0.0 on networks you trust.
+   */
+  async listen(port = 8787, host = "127.0.0.1"): Promise<number> {
     await migrateLegacySessions()
+    if (!this.settings) {
+      try {
+        this.settings = await resolveSettings()
+      } catch {
+        // No keys / no local runtime resolvable (mock/demo setup) —
+        // settings still work via the config file once one exists.
+      }
+    }
     const http = createServer((req, res) => {
       this.handle(req, res).catch((err) => {
         if (!res.headersSent) {
@@ -607,7 +634,7 @@ export class AnvilServer {
     })
     await new Promise<void>((resolve, reject) => {
       http.once("error", reject)
-      http.listen(port, "127.0.0.1", () => resolve())
+      http.listen(port, host, () => resolve())
     })
     this.server = http
     const addr = http.address()
@@ -628,9 +655,37 @@ export class AnvilServer {
     const path = url.pathname
     const method = req.method ?? "GET"
 
+    // CORS: the web UI is normally same-origin, but the mobile apps load
+    // the server UI cross-origin (from the app's own origin), and other
+    // tools may probe it. The API is unauthenticated — see listen().
+    res.setHeader("access-control-allow-origin", "*")
+    res.setHeader("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+    res.setHeader("access-control-allow-headers", "content-type, authorization")
+    if (method === "OPTIONS") {
+      res.writeHead(204)
+      res.end()
+      return
+    }
+
     if (path.startsWith("/api/")) {
       if (method === "GET" && path === "/api/health") {
         return json(res, 200, { ok: true, version: version() })
+      }
+
+      if (method === "GET" && path === "/api/local-models") {
+        // Probe a local runtime (Ollama / LM Studio / configured base) so
+        // the UI can offer its models. 200 + ok:false when nothing found.
+        const rt = await detectLocal(
+          process.env.ANVIL_LOCAL_BASE_URL || loadConfig().localBaseUrl || undefined,
+          true,
+        )
+        if (!rt) {
+          return json(res, 200, {
+            ok: false,
+            error: `no local runtime found (tried: ${localCandidatesForError()})`,
+          })
+        }
+        return json(res, 200, { ok: true, vendor: rt.vendor, baseUrl: rt.baseUrl, models: rt.models })
       }
 
       if (method === "GET" && path === "/api/config") {
@@ -644,8 +699,14 @@ export class AnvilServer {
         const patch: Partial<FileConfig> = {}
         const provider = str("provider")
         if (provider !== undefined) {
-          if (provider !== "" && provider !== "anthropic" && provider !== "openai" && provider !== "hsnr") {
-            return json(res, 400, { error: "provider must be one of: anthropic | openai | hsnr (or empty to auto-detect)" })
+          if (
+            provider !== "" &&
+            provider !== "anthropic" &&
+            provider !== "openai" &&
+            provider !== "hsnr" &&
+            provider !== "local"
+          ) {
+            return json(res, 400, { error: "provider must be one of: anthropic | openai | hsnr | local (or empty to auto-detect)" })
           }
           patch.provider = (provider || undefined) as ProviderKind
         }
@@ -653,10 +714,10 @@ export class AnvilServer {
         if (model !== undefined) patch.model = model
         const thinking = str("thinking")
         if (thinking !== undefined) {
-          if (!THINKING_LEVELS.includes(thinking as ThinkingEffort)) {
+          if (thinking !== "" && !THINKING_LEVELS.includes(thinking as ThinkingEffort)) {
             return json(res, 400, { error: `thinking must be one of: ${THINKING_LEVELS.join(" | ")}` })
           }
-          patch.thinking = thinking as ThinkingEffort
+          patch.thinking = (thinking || undefined) as ThinkingEffort
         }
         const anthropicKey = str("anthropicKey")
         if (anthropicKey !== undefined) patch.anthropicKey = anthropicKey
@@ -668,14 +729,17 @@ export class AnvilServer {
         if (hsnrKey !== undefined) patch.hsnrKey = hsnrKey
         const hsnrBase = str("hsnrBaseUrl")
         if (hsnrBase !== undefined) patch.hsnrBaseUrl = hsnrBase
+        const localBase = str("localBaseUrl")
+        if (localBase !== undefined) patch.localBaseUrl = localBase
 
         saveConfig(patch)
-        // Re-resolve the provider. When no API key is resolvable at all
-        // (e.g. a mock/demo server) the settings are still saved — model and
-        // thinking become active as soon as a key exists.
+        // Re-resolve the provider. When nothing resolvable exists
+        // (e.g. a mock/demo server without keys) the settings are still
+        // saved — model and thinking become active as soon as a key or a
+        // local runtime exists.
         let note = "settings apply to new sessions"
         try {
-          const s = resolveSettings()
+          const s = await resolveSettings()
           this.settings = s
           this.config = {
             provider: s.provider,
@@ -685,7 +749,7 @@ export class AnvilServer {
             cwd: this.config.cwd,
             maxTurns: this.config.maxTurns,
           }
-        } catch {
+        } catch (err) {
           this.settings = null
           const file = loadConfig()
           this.config = {
@@ -693,12 +757,26 @@ export class AnvilServer {
             model: file.model || this.config.model,
             thinking: file.thinking ?? this.config.thinking,
           }
-          note = "saved — no usable API key found yet, so the settings are not active"
+          note = `saved — not active yet: ${String(err).split("\n")[0].slice(0, 200)}`
         }
         return json(res, 200, { ok: true, note, config: this.configView() })
       }
 
       if (method === "POST" && path === "/api/sessions") {
+        // A provider may have become available since startup (e.g. Ollama
+        // was just started) — try to (re)resolve before giving up.
+        if (!this.config.provider) {
+          try {
+            const s = await resolveSettings()
+            this.settings = s
+            this.config = { ...this.config, provider: s.provider, kind: s.kind, model: s.model, thinking: s.thinking }
+          } catch {
+            return json(res, 503, {
+              error:
+                "no provider configured yet — set an API key in the web UI settings or start a local runtime (Ollama / LM Studio) and try again",
+            })
+          }
+        }
         const body = (await readJson(req)) ?? {}
         const id = randomUUID()
         const requested = body.mode as PermissionMode | undefined
@@ -925,18 +1003,26 @@ export class AnvilServer {
 
   private serveStatic(res: ServerResponse, urlPath: string): void {
     const name = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, "")
-    const full = normalize(join(this.webRoot, name))
-    if (!full.startsWith(this.webRoot) || !existsSync(full)) {
-      json(res, 404, { error: "not found" })
-      return
-    }
-    const ext = full.slice(full.lastIndexOf("."))
     const types: Record<string, string> = {
       ".html": "text/html; charset=utf-8",
       ".css": "text/css; charset=utf-8",
       ".js": "text/javascript; charset=utf-8",
       ".svg": "image/svg+xml",
       ".json": "application/json; charset=utf-8",
+    }
+    const ext = name.slice(name.lastIndexOf("."))
+    // Single-file exe: the web/ directory does not exist next to the
+    // binary — serve the assets embedded at build time instead.
+    const embedded = embeddedWeb(name)
+    if (embedded !== null) {
+      res.writeHead(200, { "content-type": types[ext] ?? "application/octet-stream" })
+      res.end(embedded)
+      return
+    }
+    const full = normalize(join(this.webRoot, name))
+    if (!full.startsWith(this.webRoot) || !existsSync(full)) {
+      json(res, 404, { error: "not found" })
+      return
     }
     res.writeHead(200, { "content-type": types[ext] ?? "application/octet-stream" })
     res.end(readFileSync(full))

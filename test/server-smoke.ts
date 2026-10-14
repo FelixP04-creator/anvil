@@ -3,9 +3,12 @@
 // Run with: node test/server-smoke.ts
 
 import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http"
 import { AnvilServer } from "../src/server.ts"
+import { detectLocal } from "../src/local.ts"
 import type { Provider, ProviderRequest, ProviderResponse, ToolInput } from "../src/types.ts"
 
 let failures = 0
@@ -598,6 +601,82 @@ async function main(): Promise<void> {
   check("key cleared in view", cfgGet2.hasOpenaiKey === false && cfgGet2.openaiKey === null)
   check("saved model visible without resolution", cfgGet2.model === "nokey-model")
   check("saved thinking visible without resolution", cfgGet2.thinking === "low")
+
+  console.log("\n— local provider (Ollama / LM Studio) —")
+  // A tiny OpenAI-compatible mock runtime on an ephemeral port.
+  const mockModels = ["mock-llm-1", "mock-llm-2"]
+  const mockHttp = createHttpServer((req, res) => {
+    if (req.url === "/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" })
+      res.end(JSON.stringify({ data: mockModels.map((id) => ({ id, object: "model" })) }))
+      return
+    }
+    res.writeHead(404)
+    res.end()
+  })
+  await new Promise<void>((r) => mockHttp.listen(0, "127.0.0.1", () => r()))
+  const mockBase = `http://127.0.0.1:${(mockHttp.address() as { port: number }).port}/v1`
+
+  const detected = await detectLocal(mockBase, true)
+  check("detectLocal finds the mock runtime", detected?.vendor === "custom" && detected?.baseUrl === mockBase, JSON.stringify(detected))
+  check("detectLocal lists the models", detected?.models?.join(",") === mockModels.join(","), JSON.stringify(detected?.models))
+  const dead = await detectLocal("http://127.0.0.1:1/v1", true)
+  check("detectLocal returns null for a closed port", dead === null)
+
+  // The endpoint reports what it can reach (env override, forced probe).
+  process.env.ANVIL_LOCAL_BASE_URL = "http://127.0.0.1:1/v1"
+  const lmDead = await (await fetch(`${base}/api/local-models`)).json()
+  check("local-models: closed port → ok:false", lmDead.ok === false && /no local runtime/i.test(lmDead.error), JSON.stringify(lmDead))
+  process.env.ANVIL_LOCAL_BASE_URL = mockBase
+  const lmOk = await (await fetch(`${base}/api/local-models`)).json()
+  check("local-models: mock runtime → ok:true", lmOk.ok === true && lmOk.models?.length === 2, JSON.stringify(lmOk))
+
+  // Out-of-the-box path: no API keys anywhere, but a local runtime
+  // reachable via ANVIL_LOCAL_BASE_URL → provider auto-resolves to "local".
+  const cfgFileRaw = readFileSync(cfgFile, "utf8")
+  await fetch(`${base}/api/config`, {
+    method: "PUT",
+    headers: jsonHdr,
+    body: JSON.stringify({ provider: "", model: "", openaiKey: "", anthropicKey: "", hsnrKey: "", thinking: "" }),
+  })
+  const cfgAutoLocal = await (await fetch(`${base}/api/config`)).json()
+  check("local provider auto-detected without API keys", cfgAutoLocal.provider === "local", JSON.stringify(cfgAutoLocal.provider))
+
+  // Explicit provider + empty model → first model of the runtime, thinking off.
+  const cfgPutLocal = await fetch(`${base}/api/config`, {
+    method: "PUT",
+    headers: jsonHdr,
+    body: JSON.stringify({ provider: "local", model: "", localBaseUrl: "" }),
+  })
+  check("local config saved (200)", cfgPutLocal.status === 200)
+  const cfgLocal = await (await fetch(`${base}/api/config`)).json()
+  check("local model auto-picked from the runtime", cfgLocal.model === "mock-llm-1", cfgLocal.model)
+  check("local thinking forced off", cfgLocal.thinking === "off", cfgLocal.thinking)
+
+  // A custom base URL from the config file is used.
+  const cfgPutLocalBase = await fetch(`${base}/api/config`, {
+    method: "PUT",
+    headers: jsonHdr,
+    body: JSON.stringify({ localBaseUrl: mockBase }),
+  })
+  check("local-base-url saved (200)", cfgPutLocalBase.status === 200)
+  delete process.env.ANVIL_LOCAL_BASE_URL
+  const lmViaFile = await (await fetch(`${base}/api/local-models`)).json()
+  check("local-models: base URL from config file", lmViaFile.ok === true && lmViaFile.baseUrl === mockBase, JSON.stringify(lmViaFile))
+
+  // Without any reachable runtime the settings are saved but not active.
+  const cfgPutLocalDead = await fetch(`${base}/api/config`, {
+    method: "PUT",
+    headers: jsonHdr,
+    body: JSON.stringify({ provider: "local", localBaseUrl: "http://127.0.0.1:1/v1" }),
+  })
+  const cfgLocalDead = await cfgPutLocalDead.json()
+  check("local saved while runtime is down", cfgLocalDead.ok === true && /not active/.test(cfgLocalDead.note ?? ""), JSON.stringify(cfgLocalDead.note))
+
+  // Restore the pre-section config state.
+  writeFileSync(cfgFile, cfgFileRaw, "utf8")
+  delete process.env.ANVIL_LOCAL_BASE_URL
+  await new Promise<void>((r) => mockHttp.close(() => r()))
 
   console.log("\n— abort (stop the running turn) —")
   // A fresh session whose turn parks at a permission prompt, then we abort it.
