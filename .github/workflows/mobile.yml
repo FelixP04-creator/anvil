@@ -40,19 +40,24 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug
 
+      - name: Rename APK
+        working-directory: mobile/android/app/build/outputs/apk/debug
+        run: mv app-debug.apk "anvil-mobile-${GITHUB_REF_NAME#v}-debug.apk"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: anvil-mobile-android
-          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          path: mobile/android/app/build/outputs/apk/debug/anvil-mobile-*.apk
 
       - name: Attach APK to the release
         if: startsWith(github.ref, 'v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cd mobile/android/app/build/outputs/apk/debug
           gh release upload "${{ github.ref_name }}" \
-            mobile/android/app/build/outputs/apk/debug/app-debug.apk \
+            "anvil-mobile-${GITHUB_REF_NAME#v}-debug.apk" \
             --clobber --repo "${{ github.repository }}"
 
   ios:
@@ -81,29 +86,21 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             archive -archivePath build/anvil.xcarchive
 
-      - name: Export unsigned IPA
+      - name: Package unsigned IPA
         working-directory: mobile/ios
         run: |
-          cat > export.plist <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>ad-hoc</string>
-            <key>teamID</key>
-            <string></string>
-          </dict>
-          </plist>
-          EOF
-          xcodebuild -exportArchive -archivePath build/anvil.xcarchive \
-            -exportOptionsPlist export.plist -exportPath build/export
+          # xcodebuild -exportArchive wants a team even for ad-hoc; an
+          # unsigned IPA is just a zip of Payload/App.app, and sideloaders
+          # (AltStore, SideSync) re-sign it for the device anyway.
+          mkdir -p build/unsigned/Payload
+          cp -R build/anvil.xcarchive/Products/Applications/App.app build/unsigned/Payload/
+          (cd build/unsigned && zip -qr "anvil-mobile-${GITHUB_REF_NAME#v}-unsigned.ipa" Payload)
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: anvil-mobile-ios
-          path: mobile/ios/build/export/*.ipa
+          path: mobile/ios/build/unsigned/*.ipa
 
       - name: Attach IPA to the release
         if: startsWith(github.ref, 'v')
@@ -111,5 +108,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ github.ref_name }}" \
-            mobile/ios/build/export/*.ipa \
+            mobile/ios/build/unsigned/*.ipa \
             --clobber --repo "${{ github.repository }}"
